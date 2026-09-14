@@ -1,0 +1,38 @@
+# This repository tracks the Python scripts and nothing else.
+# Credentials, run state, data inputs/outputs and IDE files stay local.
+
+# --- Credentials ---------------------------------------------------------
+.env
+.env.*
+!.env.example
+auth.json
+*_auth.json
+config/
+generated_passwords.csv
+
+# --- Everything that is not source -------------------------------------
+*
+!*.py
+!.gitignore
+!.env.example
+!README.md
+
+# --- Never track these even if a rule above would ----------------------
+*.log
+*.csv
+*.zip
+*.html
+*.pyc
+
+# --- Python / IDE -------------------------------------------------------
+__pycache__/
+*.py[cod]
+.idea/
+.vscode/
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
