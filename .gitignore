@@ -17,6 +17,7 @@ generated_passwords.csv
 !.env.example
 !README.md
 !EGYPT_METADATA_CHANGES.md
+!EGYPT_INSTANCE_DIFF.md
 
 # --- Never track these even if a rule above would ----------------------
 *.log

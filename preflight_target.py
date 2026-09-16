@@ -23,6 +23,7 @@ from logzero import logger
 
 import move_patients_egypt as gen
 import purge_aggregate_values as agg
+from diff_metadata import looks_disabled
 from tracker_common import load_api
 
 DEFAULT_TARGET = 'EGYPT_SANDBOX3'
@@ -57,6 +58,111 @@ def exists(api, endpoint, uids, label, extra_fields='id,name'):
     if missing:
         logger.warning(f"      absent: {missing}")
     return sorted(found), missing
+
+
+def check_stage_assignments(api):
+    """
+    Whether the visit stage carries the data elements the generator writes.
+
+    A data element that exists but is not assigned to the stage cannot be
+    captured, and a program rule that assigns to it silently does nothing. That
+    is how Risk Classification came to be computed but never stored.
+    """
+    problems = 0
+    try:
+        stage = api.get(f'programStages/{gen.TARGET_PROGRAM_STAGE}', params={
+            'fields': 'name,programStageDataElements[dataElement[id,name]]'}).json()
+    except DHIS2RequestException as e:
+        logger.error(f"  visit stage lookup failed ({str(e)[:80]})")
+        return 1
+
+    assigned = {(m.get('dataElement') or {}).get('id')
+                for m in stage.get('programStageDataElements', [])}
+    wanted = set(gen.DE.values())
+    missing = sorted(wanted - assigned)
+    logger.info(f"  stage carries {len(assigned)} data element(s); "
+                f"{len(wanted - set(missing))}/{len(wanted)} the generator writes")
+    if missing:
+        logger.error(f"  {len(missing)} data element(s) the generator writes are "
+                     f"NOT assigned to the stage:")
+        for uid in missing:
+            name = next((k for k, v in gen.DE.items() if v == uid), '?')
+            logger.error(f"      {uid}  {name}")
+        problems += 1
+    return problems
+
+
+def check_program_rules(api):
+    """
+    Report program rules that have been taken out of service.
+
+    A rule is disabled by marking its name or by wiring a constant false into
+    its condition; neither shows up as a missing object, so a run against such
+    an instance quietly produces data with no derived values.
+    """
+    try:
+        rules = api.get('programRules', params={
+            'filter': f'program.id:eq:{gen.TARGET_PROGRAM}', 'paging': 'false',
+            'fields': 'id,name,condition'}).json()['programRules']
+    except DHIS2RequestException as e:
+        logger.error(f"  program rule lookup failed ({str(e)[:80]})")
+        return 1
+
+    disabled = [(r, looks_disabled(r)) for r in rules]
+    disabled = [(r, why) for r, why in disabled if why]
+    logger.info(f"  {len(rules)} program rule(s) on the programme, "
+                f"{len(disabled)} out of service")
+    for rule, why in disabled:
+        logger.warning(f"      {rule['id']}  {rule['name'][:52]} "
+                       f"(via {'+'.join(why)})")
+    return 0
+
+
+def check_program_indicators(api):
+    """
+    Check the program indicators that feed the aggregate export.
+
+    Two traps, both hit for real: an indicator with no decimals set has its
+    values rejected by the exchange when the target data element is an integer
+    (E7619), and an EVENT-type indicator with no period boundaries generates
+    malformed SQL rather than an error.
+    """
+    problems = 0
+    try:
+        pis = api.get('programIndicators', params={
+            'filter': f'program.id:eq:{gen.TARGET_PROGRAM}', 'paging': 'false',
+            'fields': 'id,name,analyticsType,decimals,'
+                      'analyticsPeriodBoundaries[id],'
+                      'attributeValues[value,attribute[id]]',
+        }).json()['programIndicators']
+    except DHIS2RequestException as e:
+        logger.error(f"  program indicator lookup failed ({str(e)[:80]})")
+        return 1
+
+    mapped = [p for p in pis
+              if any((av.get('attribute') or {}).get('id') == MAPPING_ATTRIBUTE
+                     for av in p.get('attributeValues', []))]
+    logger.info(f"  {len(pis)} program indicator(s), {len(mapped)} mapped to an "
+                f"aggregate data element")
+
+    no_decimals = [p for p in mapped if p.get('decimals') is None]
+    no_boundaries = [p for p in pis
+                     if p.get('analyticsType') == 'EVENT'
+                     and not p.get('analyticsPeriodBoundaries')]
+
+    if no_decimals:
+        logger.error(f"  {len(no_decimals)} exported indicator(s) have no "
+                     f"decimals set; the exchange will reject their values:")
+        for p in no_decimals[:10]:
+            logger.error(f"      {p['id']}  {p['name'][:52]}")
+        problems += 1
+    if no_boundaries:
+        logger.error(f"  {len(no_boundaries)} EVENT-type indicator(s) have no "
+                     f"period boundaries; their SQL is malformed:")
+        for p in no_boundaries[:10]:
+            logger.error(f"      {p['id']}  {p['name'][:52]}")
+        problems += 1
+    return problems
 
 
 def main():
@@ -164,6 +270,15 @@ def main():
     except DHIS2RequestException as e:
         logger.error(f"  exchange lookup failed ({str(e)[:80]})")
         problems += 1
+
+    logger.info("visit stage data element assignments")
+    problems += check_stage_assignments(api)
+
+    logger.info("program rules")
+    problems += check_program_rules(api)
+
+    logger.info("program indicators")
+    problems += check_program_indicators(api)
 
     logger.info("option codes the generator emits")
     try:

@@ -364,17 +364,32 @@ def age_from_dob(dob_iso, on=None):
 
 PRODUCTION_MARKERS = ('PROD', 'PRODUCTION', 'LIVE')
 
+# Hosts confirmed by hand not to be production. The rule below treats an
+# unrecognised host as production, which is the safe default but rejects a
+# non-production host whose name does not advertise itself - the Egypt staging
+# instance is simply dhis2.space. Listing it here keeps the default strict
+# instead of loosening the rule for every host.
+KNOWN_NON_PRODUCTION_HOSTS = (
+    'dhis2-sandbox3.simple.org',
+    'dhis2.space',
+)
+
 
 def looks_like_production(prefix, base_url=''):
     """
     Whether this target looks like a production instance.
 
     Checks the credential prefix and the resolved URL, because a prefix can be
-    renamed but the URL usually gives it away.
+    renamed but the URL usually gives it away. A host nobody has vouched for is
+    treated as production: the cost of a false alarm is one flag, the cost of a
+    miss is destroyed patient data.
     """
     haystack = f"{prefix} {base_url}".upper()
     if any(m in haystack for m in PRODUCTION_MARKERS):
         return True
+    if any(host.upper() in base_url.upper()
+           for host in KNOWN_NON_PRODUCTION_HOSTS):
+        return False
     # A URL with no sandbox/staging/demo/test marker in it is suspect.
     safe = ('SANDBOX', 'STAGING', 'DEMO', 'TEST', 'DEV', 'LOCALHOST')
     if base_url and not any(m in base_url.upper() for m in safe):
