@@ -2,7 +2,8 @@ from dhis2 import Api, RequestException as DHIS2RequestException, setup_logger
 import json
 import random
 from faker import Faker
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import re
 from logzero import logger, logfile
 import time
 import argparse
@@ -507,44 +508,128 @@ def deterministic_mapping(source_ous, target_ous):
 
 DOB_ATTRIBUTE = "NI0QRzJvQ0k"
 
+# Age band used only when a date of birth cannot be read or inferred at all.
+GENERATED_DOB_MIN_AGE = 45
+GENERATED_DOB_MAX_AGE = 65
+
+# Representations seen in the source. Day-first legacy formats plus ISO.
+DOB_FORMATS = (
+    "%Y-%m-%d",
+    "%Y/%m/%d",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+    "%d %m %Y",
+)
+
+# The DOB field doubles as an age field in the source: "59", "53 years",
+# "55 years ", "48 yrs old". Captured so the real age can be converted to a
+# date of birth instead of being thrown away.
+AGE_PATTERN = re.compile(
+    r"^(\d{1,3})\s*(?:years?|yrs?|y|anos|a[nñ]os|ans)?\s*(?:old)?$",
+    re.IGNORECASE,
+)
+
+
+def generate_dob():
+    """A plausible date of birth for an adult NCD patient, as YYYY-MM-DD."""
+    return fake.date_of_birth(
+        minimum_age=GENERATED_DOB_MIN_AGE,
+        maximum_age=GENERATED_DOB_MAX_AGE,
+    ).isoformat()
+
+
+def dob_from_age(age):
+    """
+    Convert a whole-year age to a date of birth, as YYYY-MM-DD.
+
+    The birthday is spread over the twelve months that the age allows, so
+    age-derived patients do not all end up sharing today's birthday. The age
+    is still exact as of today.
+    """
+    today = date.today()
+
+    def years_ago(years):
+        try:
+            return today.replace(year=today.year - years)
+        except ValueError:
+            # 29 February in a year whose counterpart is not a leap year.
+            return today.replace(year=today.year - years, day=28)
+
+    latest = years_ago(age)                              # birthday is today
+    earliest = years_ago(age + 1) + timedelta(days=1)    # birthday was yesterday
+    span = max((latest - earliest).days, 0)
+
+    return (earliest + timedelta(days=random.randint(0, span))).isoformat()
+
+
+def parse_dob(raw_value):
+    """
+    Best-effort conversion of a source DOB to YYYY-MM-DD.
+
+    Handles real dates first, then the ages the source stores in the same
+    field. Returns None only when the value carries nothing usable, so the
+    caller can fall back to a generated date.
+    """
+    if raw_value is None:
+        return None
+
+    # Collapse whitespace runs and trim: the source holds values such as
+    # "08/09/ 1952", "24 06 1946" and "55 years ".
+    value = " ".join(str(raw_value).split())
+
+    if not value:
+        return None
+
+    # A real date wins over any age reading. Try the value as written and with
+    # the spaces removed, so "24 06 1946" and "08/09/ 1952" both parse.
+    for candidate in (value, value.replace(" ", "")):
+        for date_format in DOB_FORMATS:
+            try:
+                return datetime.strptime(candidate[:10], date_format).date().isoformat()
+            except ValueError:
+                pass
+
+    # The field often holds an age instead: "59", "53 years", "48 yrs old".
+    age_match = AGE_PATTERN.match(value)
+    if age_match:
+        age = int(age_match.group(1))
+        if 0 < age < 120:
+            return dob_from_age(age)
+
+    return None
+
+
 def normalize_dob_attributes(tracked_entity):
     """
-    Normalize Date of Birth / AGE attribute values to YYYY-MM-DD.
-    Return False when the mandatory DOB cannot be parsed, so the caller can
-    skip the entire tracked entity instead of importing an invalid enrollment.
+    Normalize the Date of Birth / AGE attribute to YYYY-MM-DD.
+
+    DOB is mandatory in the target program. A value that cannot be read as a
+    date is replaced with a generated one for a GENERATED_DOB_MIN_AGE to
+    GENERATED_DOB_MAX_AGE year old, rather than dropping the patient.
+
+    Returns True when a date had to be generated.
     """
+    generated = False
+
     for attr in tracked_entity.get("attributes", []):
-        if attr.get("attribute") == DOB_ATTRIBUTE:
-            raw_value = attr.get("value")
+        if attr.get("attribute") != DOB_ATTRIBUTE:
+            continue
 
-            if not raw_value:
-                logger.warning(
-                    f"Skipping trackedEntity {tracked_entity.get('trackedEntity')}: required DOB is empty"
-                )
-                return False
+        raw_value = attr.get("value")
+        parsed_value = parse_dob(raw_value)
 
-            # The source contains several legacy day-first representations.
-            # Strip incidental spaces (for example, "08/09/ 1952") and
-            # convert every supported representation to DHIS2's ISO format.
-            normalized_value = "".join(str(raw_value).split())
-            parsed_value = None
-            for date_format in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
-                try:
-                    parsed_value = datetime.strptime(normalized_value[:10], date_format).date().isoformat()
-                    break
-                except ValueError:
-                    pass
+        if parsed_value is None:
+            parsed_value = generate_dob()
+            generated = True
+            logger.warning(
+                f"trackedEntity {tracked_entity.get('trackedEntity')}: DOB "
+                f"{raw_value!r} is not a usable date; generated {parsed_value}"
+            )
 
-            if parsed_value is None:
-                logger.warning(
-                    f"Skipping trackedEntity {tracked_entity.get('trackedEntity')}: "
-                    f"required DOB '{raw_value}' cannot be normalized"
-                )
-                return False
+        attr["value"] = parsed_value
 
-            attr["value"] = parsed_value
-
-    return True
+    return generated
 
 
 def main():
@@ -663,6 +748,7 @@ def main():
         teis_ready_to_post = list()
         diabetic_with_data = 0
         diabetic_without_data = 0
+        generated_dobs = 0
         for tei in suitable_teis:
             skip = False
 
@@ -840,11 +926,11 @@ def main():
             # Replace the enrollments list with just the consolidated one
             tei['enrollments'] = [main_enrollment]
 
-            # NI0QRzJvQ0k is mandatory in the target program. Do not remove a
-            # bad DOB attribute and send an invalid enrollment; skip only that
-            # TEI so the remaining records in the batch can still import.
-            if not normalize_dob_attributes(tei):
-                continue
+            # NI0QRzJvQ0k is mandatory in the target program. Dates and ages
+            # are converted; only a value with nothing usable in it gets a
+            # generated date, so no patient is dropped over a bad DOB.
+            if normalize_dob_attributes(tei):
+                generated_dobs += 1
 
             for enrollment in tei.get('enrollments', []):
                 enrollment['orgUnit'] = ou_to_use
@@ -940,6 +1026,11 @@ def main():
                 f"({diabetic_with_data} with blood-sugar data, "
                 f"{diabetic_without_data} without)"
             )
+            if generated_dobs:
+                logger.info(
+                    f"DOB: {generated_dobs} of {len(teis_ready_to_post)} patients "
+                    f"needed a generated date of birth"
+                )
             logger.info('Posting TEIs to org unit ' + ous_westland[ou_to_use]['name'])
             # with open("payloads_output.json", "w") as out_file:
             #     json.dump(teis_ready_to_post, out_file, indent=2)

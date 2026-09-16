@@ -16,6 +16,7 @@ generated_passwords.csv
 !.gitignore
 !.env.example
 !README.md
+!EGYPT_METADATA_CHANGES.md
 
 # --- Never track these even if a rule above would ----------------------
 *.log
