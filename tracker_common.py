@@ -357,3 +357,54 @@ def age_from_dob(dob_iso, on=None):
     on = on or date.today()
     born = datetime.strptime(dob_iso, "%Y-%m-%d").date()
     return on.year - born.year - ((on.month, on.day) < (born.month, born.day))
+
+# ---------------------------------------------------------------------------
+# Guard for destructive scripts
+# ---------------------------------------------------------------------------
+
+PRODUCTION_MARKERS = ('PROD', 'PRODUCTION', 'LIVE')
+
+
+def looks_like_production(prefix, base_url=''):
+    """
+    Whether this target looks like a production instance.
+
+    Checks the credential prefix and the resolved URL, because a prefix can be
+    renamed but the URL usually gives it away.
+    """
+    haystack = f"{prefix} {base_url}".upper()
+    if any(m in haystack for m in PRODUCTION_MARKERS):
+        return True
+    # A URL with no sandbox/staging/demo/test marker in it is suspect.
+    safe = ('SANDBOX', 'STAGING', 'DEMO', 'TEST', 'DEV', 'LOCALHOST')
+    if base_url and not any(m in base_url.upper() for m in safe):
+        return True
+    return False
+
+
+def guard_destructive(prefix, api, allow_production, what='delete or overwrite data'):
+    """
+    Stop a destructive script pointed at something that looks like production.
+
+    The toolkit's purge and rebuild scripts are written for demo instances. The
+    same .env now holds staging and production credentials, so one mistyped
+    --target would be enough to destroy real records.
+    """
+    base_url = getattr(api, 'base_url', '') or ''
+    if not looks_like_production(prefix, base_url):
+        return
+
+    if allow_production:
+        logger.warning(
+            f"{prefix} ({base_url}) looks like PRODUCTION and --allow-production "
+            f"was given. About to {what}."
+        )
+        return
+
+    logger.error(f"REFUSING to run: {prefix} ({base_url}) looks like a "
+                 f"production instance, and this script will {what}.")
+    logger.error("  If that is genuinely what you want, re-run with "
+                 "--allow-production.")
+    logger.error("  If not, check --target. Demo targets: EGYPT_SANDBOX3, "
+                 "EGYPT_STAGING.")
+    sys.exit(3)

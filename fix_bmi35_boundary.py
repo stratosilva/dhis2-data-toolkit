@@ -35,7 +35,8 @@ from logzero import logger
 
 from tracker_common import load_api
 
-TARGET_ENV_PREFIX = 'EGYPT_NCD'
+# Sandbox 3, not production. These scripts purge and rewrite data.
+TARGET_ENV_PREFIX = 'EGYPT_SANDBOX3'
 PROGRAM = 'pMIglSEqPGS'
 CONFIRM_PHRASE = 'APPLY'
 
@@ -73,12 +74,14 @@ def validate_condition(api, condition):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--target', default=TARGET_ENV_PREFIX,
+                        help='Credential prefix in .env naming the instance to act on (default: %(default)s). Use this to point the same script at a different Egypt instance, e.g. --target EGYPT_STAGING.')
     parser.add_argument('--confirm', default=None,
                         help=f'Type {CONFIRM_PHRASE} to save the changes. Without it '
                              'the script only reports what it would do.')
     args = parser.parse_args()
 
-    api = load_api(TARGET_ENV_PREFIX, 'target (Egypt NCD)')
+    api = load_api(args.target, f'target ({args.target})')
     logger.info(f"Target DHIS2 {api.version}")
 
     rules = load_rules(api)

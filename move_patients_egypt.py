@@ -42,6 +42,7 @@ from requests.exceptions import RequestException as RequestsRequestException
 
 from tracker_common import (
     age_from_dob,
+    guard_destructive,
     deterministic_mapping,
     delete_resume_file,
     dob_from_age,
@@ -59,7 +60,8 @@ FAILED_TEIS_FILE = 'failed_teis_egypt.jsonl'
 LOG_FILE = './move_patients_egypt.log'
 
 SOURCE_ENV_PREFIX = 'NIGERIA_NCD'
-TARGET_ENV_PREFIX = 'EGYPT_NCD'
+# Sandbox 3, not production. These scripts purge and rewrite data.
+TARGET_ENV_PREFIX = 'EGYPT_SANDBOX3'
 
 SOURCE_PROGRAM = 'pMIglSEqPGS'
 TARGET_PROGRAM = 'pMIglSEqPGS'
@@ -2208,6 +2210,10 @@ def parse_args():
         description='Generate a population for the Egypt HTN/DM programme, or '
                     'migrate one from the Nigeria NCD instance'
     )
+    parser.add_argument('--target', default=TARGET_ENV_PREFIX,
+                        help='Credential prefix in .env naming the instance to act on (default: %(default)s). Use this to point the same script at a different Egypt instance, e.g. --target EGYPT_STAGING.')
+    parser.add_argument('--allow-production', action='store_true',
+                        help='Permit running against a target that looks like production. Off by default; these scripts destroy data.')
     parser.add_argument('--patients', type=int, default=500,
                         help='How many patients to generate, spread evenly over the '
                              'target facilities (default: 500). Ignored with '
@@ -2331,7 +2337,9 @@ def main():
 
     window_start = resolve_window_start(args)
 
-    api_target = load_api(TARGET_ENV_PREFIX, 'target (Egypt NCD)')
+    api_target = load_api(args.target, f'target ({args.target})')
+    guard_destructive(args.target, api_target,
+                      args.allow_production, 'create and overwrite patient records')
     logger.warning(f"Target DHIS2 {api_target.version} rev {api_target.revision}")
 
     api_source = None

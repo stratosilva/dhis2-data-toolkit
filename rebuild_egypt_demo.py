@@ -27,11 +27,22 @@ from logzero import logfile, logger
 
 from tracker_common import load_api
 
-TARGET_ENV_PREFIX = 'EGYPT_NCD'
-EXCHANGES = [
-    ('ty6LYIC2aE5', 'ADEX - HTN DM - Previous periods'),
-    ('tQ3bUoFoaSI', 'ADEX - HTN DM - Current period'),
-]
+# Sandbox 3, not production. These scripts purge and rewrite data.
+TARGET_ENV_PREFIX = 'EGYPT_SANDBOX3'
+# Discovered by name at run time rather than hardcoded: exchange UIDs differ
+# between instances, and running the wrong one silently writes nothing.
+EXCHANGE_NAME_PREFIX = 'ADEX - HTN DM'
+
+
+def find_exchanges(api):
+    """The HTN/DM aggregate data exchanges on this instance."""
+    found = api.get('aggregateDataExchanges', params={
+        'fields': 'id,name', 'paging': 'false'}).json()['aggregateDataExchanges']
+    matching = [(e['id'], e['name']) for e in found
+                if e.get('name', '').startswith(EXCHANGE_NAME_PREFIX)]
+    # Previous periods before current, so the 12-month backfill lands first.
+    matching.sort(key=lambda x: 'Current' in x[1])
+    return matching
 ANALYTICS_TIMEOUT_SECONDS = 900
 ANALYTICS_POLL_SECONDS = 10
 
@@ -127,30 +138,38 @@ def main():
     parser.add_argument('--after', default='2025-09-01')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--chunk-size', type=int, default=10)
+    parser.add_argument('--target', default=TARGET_ENV_PREFIX,
+                        help='Credential prefix in .env naming the instance to '
+                             'rebuild (default: %(default)s). e.g. --target '
+                             'EGYPT_STAGING')
     parser.add_argument('--skip-purge', action='store_true',
                         help='Leave the existing patients in place')
     args = parser.parse_args()
 
     logfile('./rebuild_egypt_demo.log')
-    api = load_api(TARGET_ENV_PREFIX, 'target (Egypt NCD)')
+    api = load_api(args.target, f'target ({args.target})')
     logger.warning(f"Rebuilding on {api.base_url} (DHIS2 {api.version})")
 
     if not args.skip_purge:
         step("purge tracker patients")
-        run(['purge_egypt_patients.py', '--confirm', 'DELETE'])
+        run(['purge_egypt_patients.py', '--target', args.target, '--confirm', 'DELETE'])
 
         step("purge aggregate values")
-        run(['purge_aggregate_values.py', '--confirm', 'DELETE'])
+        run(['purge_aggregate_values.py', '--target', args.target, '--confirm', 'DELETE'])
 
     step(f"generate {args.patients} patients")
-    run(['move_patients_egypt.py', '--after', args.after,
+    run(['move_patients_egypt.py', '--target', args.target, '--after', args.after,
          '--patients', str(args.patients), '--seed', str(args.seed),
          '--chunk-size', str(args.chunk_size)])
 
     run_analytics(api, 'so the indicators see the new patients')
 
     step("run the aggregate data exchanges")
-    for uid, name in EXCHANGES:
+    exchanges = find_exchanges(api)
+    if not exchanges:
+        logger.error(f"No aggregate data exchange named '{EXCHANGE_NAME_PREFIX}...' "
+                     f"on this instance; the aggregate values cannot be rebuilt.")
+    for uid, name in exchanges:
         run_exchange(api, uid, name)
 
     run_analytics(api, 'so the dashboard sees the new aggregate values')

@@ -33,9 +33,10 @@ from datetime import date, timedelta
 from dhis2 import RequestException as DHIS2RequestException
 from logzero import logger
 
-from tracker_common import load_api
+from tracker_common import guard_destructive, load_api
 
-TARGET_ENV_PREFIX = 'EGYPT_NCD'
+# Sandbox 3, not production. These scripts purge and rewrite data.
+TARGET_ENV_PREFIX = 'EGYPT_SANDBOX3'
 CONFIRM_PHRASE = 'DELETE'
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,10 @@ def delete_values(api, values):
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--target', default=TARGET_ENV_PREFIX,
+                        help='Credential prefix in .env naming the instance to act on (default: %(default)s). Use this to point the same script at a different Egypt instance, e.g. --target EGYPT_STAGING.')
+    parser.add_argument('--allow-production', action='store_true',
+                        help='Permit running against a target that looks like production. Off by default; these scripts destroy data.')
     parser.add_argument('--confirm', default=None,
                         help=f"Type {CONFIRM_PHRASE} to actually delete. Without it the "
                              "script only reports what it found.")
@@ -255,7 +260,9 @@ def main():
         logger.error(f"--from {start} is after --to {end}")
         sys.exit(2)
 
-    api = load_api(TARGET_ENV_PREFIX, 'target (Egypt NCD)')
+    api = load_api(args.target, f'target ({args.target})')
+    guard_destructive(args.target, api,
+                      args.allow_production, 'delete aggregate data values')
     logger.info(f"Target DHIS2 {api.version}")
 
     org_unit = args.org_unit
