@@ -37,7 +37,8 @@ from datetime import datetime
 from dhis2 import RequestException as DHIS2RequestException
 from logzero import logger
 
-from diff_metadata import NEVER_BULK, SELECTION_FILE, SPECS
+from diff_metadata import (NEVER_BULK, SELECTION_FILE, SPECS, differing_fields,
+                           normalise)
 from tracker_common import guard_destructive, load_api
 
 CONFIRM_PHRASE = 'APPLY'
@@ -452,8 +453,21 @@ def main():
             payload.update(owned_children(source_api, item['type'], item['uid']))
             verb = 'created'
         else:
+            # The differing fields are recomputed against what the two
+            # instances hold right now, not taken from the selection file. The
+            # file says which objects to act on; between generating it and
+            # running this, an object recorded as missing may have been created
+            # by hand, and its stale (empty) field list would otherwise make
+            # the script give up on an object it could patch.
+            live = differing_fields(
+                normalise(source, SPECS[item['type']], False, False),
+                normalise(current, SPECS[item['type']], False, False))
+            if not live:
+                logger.info(f"  {action:9} {label}: already identical")
+                results['ok'] += 1
+                continue
             merged, applied, skipped = merge_fields(
-                source, current, item.get('fields') or [], item['type'])
+                source, current, sorted(live), item['type'])
             if not applied:
                 logger.warning(f"  {action:9} {label}: nothing this script can "
                                f"patch (differs in {', '.join(skipped)})")
