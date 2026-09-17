@@ -1918,6 +1918,61 @@ def warn_rule_assigned_fields(api):
         )
 
 
+def resolve_target_org_units(api, args):
+    """
+    The facilities to post to: the ones the programme is actually assigned to.
+
+    Taking every org unit at the facility level is wrong on a real instance.
+    Egypt's hierarchy has over eleven thousand facilities but the programme is
+    only assigned to the handful in the pilot, and an enrolment at an org unit
+    the programme is not assigned to is rejected. So the programme's own
+    assignment is the list, filtered to the facility level in case the
+    programme is also assigned at district level for reporting.
+
+    --target-ou-level still applies, and --any-org-unit falls back to the old
+    level-wide behaviour for an instance where the programme has no assignment
+    yet.
+    """
+    program = api.get(f'programs/{TARGET_PROGRAM}', params={
+        'fields': 'organisationUnits[id,name,level]'}).json()
+    assigned = program.get('organisationUnits') or []
+
+    if assigned and not args.any_org_unit:
+        at_level = [o for o in assigned if o.get('level') == args.target_ou_level]
+        if not at_level:
+            levels = sorted({o.get('level') for o in assigned})
+            logger.error(
+                f"The programme is assigned to {len(assigned)} org unit(s), but none "
+                f"at level {args.target_ou_level} (they are at level(s) {levels}). "
+                f"Pass --target-ou-level with the right level.")
+            sys.exit(2)
+        logger.info(f"Posting to {len(at_level)} facility/ies the programme is "
+                    f"assigned to (of {len(assigned)} assigned org units)")
+        return reindex(at_level, 'id')
+
+    if not assigned:
+        logger.warning(
+            f"The programme {TARGET_PROGRAM} is assigned to no org units on this "
+            f"instance; falling back to every org unit at level "
+            f"{args.target_ou_level}. Enrolments will be rejected unless the "
+            f"programme is assigned first.")
+
+    target_ous = api.get(
+        'organisationUnits',
+        params={'filter': f'level:eq:{args.target_ou_level}',
+                'paging': 'false', 'fields': 'id,name'}
+    ).json()['organisationUnits']
+
+    if not target_ous:
+        logger.error(f"No org units at level {args.target_ou_level} on the target. "
+                     "Pass --target-ou-level with the facility level.")
+        sys.exit(2)
+
+    logger.info(f"Target facilities at level {args.target_ou_level}: "
+                f"{len(target_ous)}")
+    return reindex(target_ous, 'id')
+
+
 def check_target_metadata(api):
     """Load the district list and validate every code the script can emit."""
     district_codes = fetch_option_codes(api, DISTRICT_OPTION_SET, 'Egypt districts')
@@ -2268,6 +2323,11 @@ def parse_args():
                              'slow, so keep this small (default: 10)')
     parser.add_argument('--target-ou-level', type=int, default=4,
                         help='Org unit level to use as target facilities (default: 4)')
+    parser.add_argument('--any-org-unit', action='store_true',
+                        help='Post to every org unit at the facility level instead '
+                             'of only those the programme is assigned to. The '
+                             'programme assignment is the right list on a real '
+                             'instance; this is an escape hatch.')
     parser.add_argument('--skip-rules', action='store_true',
                         help='Disable the server-side program rule engine. Off by '
                              'default: the Egypt programme needs rules to derive '
@@ -2350,19 +2410,7 @@ def main():
     district_codes = check_target_metadata(api_target)
     warn_rule_assigned_fields(api_target)
 
-    target_ous = api_target.get(
-        'organisationUnits',
-        params={'filter': f'level:eq:{args.target_ou_level}',
-                'paging': 'false', 'fields': 'id,name'}
-    ).json()['organisationUnits']
-
-    if not target_ous:
-        logger.error(f"No org units at level {args.target_ou_level} on the target. "
-                     "Pass --target-ou-level with the facility level.")
-        sys.exit(2)
-
-    target_ous = reindex(target_ous, 'id')
-    logger.info(f"Target facilities at level {args.target_ou_level}: {len(target_ous)}")
+    target_ous = resolve_target_org_units(api_target, args)
 
     stats = {k: 0 for k in ('no_enrollment', 'no_sex', 'young_cohort', 'age_rebased',
                             'generated_dob', 'hypertensive', 'diabetic', 'smoker',

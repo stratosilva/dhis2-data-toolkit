@@ -245,9 +245,28 @@ def main():
         ous = api.get('organisationUnits', params={
             'filter': f'level:eq:{args.ou_level}', 'fields': 'id',
             'paging': 'false'}).json()['organisationUnits']
-        if ous:
-            logger.info(f"  level {args.ou_level} facilities              {len(ous)}")
-        else:
+        logger.info(f"  level {args.ou_level} org units             {len(ous)}")
+
+        # What matters is not how many facilities exist but how many the
+        # programme is assigned to: an enrolment at an unassigned org unit is
+        # rejected, and on a national hierarchy the difference is thousands.
+        assigned = (api.get(f'programs/{gen.TARGET_PROGRAM}', params={
+            'fields': 'organisationUnits[id,level]'}).json()
+            .get('organisationUnits') or [])
+        at_level = [o for o in assigned if o.get('level') == args.ou_level]
+        logger.info(f"  programme is assigned to        {len(assigned)} org unit(s), "
+                    f"{len(at_level)} at level {args.ou_level}")
+
+        if not assigned:
+            logger.error(f"  the programme is assigned to no org units; every "
+                         f"enrolment would be rejected")
+            problems += 1
+        elif not at_level:
+            levels = sorted({o.get('level') for o in assigned})
+            logger.error(f"  none of the assigned org units are at level "
+                         f"{args.ou_level} (they are at {levels}); pass --ou-level")
+            problems += 1
+        elif not ous:
             logger.error(f"  no org units at level {args.ou_level}; pass "
                          f"--ou-level with the facility level")
             problems += 1
