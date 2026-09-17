@@ -108,6 +108,13 @@ def merge_fields(source, dest, fields, obj_type):
                 else:
                     skipped.append(f"{field} (nothing to add)")
                 continue
+            if field == 'attributeValues':
+                changed = merge_attribute_values(source, merged)
+                if changed:
+                    applied.append(f"{field} ({', '.join(changed)})")
+                else:
+                    skipped.append(f"{field} (nothing to change)")
+                continue
             skipped.append(field)
             continue
         if field in source:
@@ -152,6 +159,42 @@ OWNED_CHILDREN = {
     'programRules': ('programRuleActions', 'programRule.id'),
     'optionSets': ('options', 'optionSet.id'),
 }
+
+
+def merge_attribute_values(source, merged):
+    """
+    Take the source's metadata attribute values, keeping any the destination
+    has of its own.
+
+    This matters for `vudyDP7jUy5`, "Data element for aggregate data export".
+    Its value on a program indicator names the aggregate data element the
+    exchange writes that indicator's results into - the exchange holds no
+    mapping table, it reads this attribute off each indicator via
+    `outputIdScheme: ATTRIBUTE:vudyDP7jUy5`. An indicator without it exports
+    nowhere, silently.
+
+    Upserted by attribute rather than replaced wholesale, so an attribute only
+    the destination sets is not dropped.
+    """
+    by_attribute = {(m.get('attribute') or {}).get('id'): m
+                    for m in merged.get('attributeValues', [])
+                    if (m.get('attribute') or {}).get('id')}
+    changed = []
+
+    for member in source.get('attributeValues', []):
+        attribute = (member.get('attribute') or {}).get('id')
+        if not attribute:
+            continue
+        existing = by_attribute.get(attribute, {}).get('value')
+        if existing == member.get('value'):
+            continue
+        by_attribute[attribute] = {'attribute': {'id': attribute},
+                                   'value': member.get('value')}
+        changed.append(attribute)
+
+    if changed:
+        merged['attributeValues'] = list(by_attribute.values())
+    return changed
 
 
 def owned_children(api, obj_type, uid):
