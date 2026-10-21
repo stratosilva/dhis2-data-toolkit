@@ -1078,7 +1078,14 @@ def build_visit(profile, step, bp_state, dm_at_target, with_labs):
     values[DE['systolic']] = str(systolic)
     values[DE['diastolic']] = str(diastolic)
 
-    # Height carries over from enrolment; weight varies a little per visit.
+    # Height is sent on every visit even though rule zoyvkFzuZIC 'ASSIGN
+    # Height from TEA to DE' also copies it from the height attribute. That
+    # rule is enough in the Capture app, where rules re-evaluate as the form is
+    # filled, but not on import: a rule's assignment is not visible to another
+    # rule's condition in the same payload. Rule eSOdGrU8dC4 'Reset BMI' fires
+    # on `!d2:hasValue(#{Height})`, assigns NULL over the BMI we send, and the
+    # event is rejected with E1307 - which also costs the risk score, since
+    # that reads BMI. Weight is captured per visit and varies a little.
     values[DE['height_cm']] = str(profile['height_cm'])
     bmi = max(profile['bmi_target'] + random.uniform(-0.8, 0.8), 16.0)
     weight = weight_for(profile['height_cm'], bmi)
