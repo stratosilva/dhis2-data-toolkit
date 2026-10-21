@@ -51,7 +51,7 @@ TEA_SEX = "oindugucx72"           # "Sex" (MALE/FEMALE)
 TEA_NCD_STATUS = "fI1P3Mg1zOZ"    # "HTN - NCD Patient Status"
 TEA_ADDRESS = "A6Hb0Kvg4vb"       # "Address (current)"
 TEA_PATIENT_PHONE = "YRDy9xy9jD0" # "Patient Phone Number"
-TEA_PATIENT_DOB = "NI0QRzJvQ0k" # "Patient Phone Number"
+TEA_PATIENT_DOB = "NI0QRzJvQ0k"   # "Date of birth" (AGE, expects yyyy-mm-dd)
 TEA_SUPPORTER_NAME = "JO6OoiD83nH"
 TEA_SUPPORTER_PHONE = "JUWgfAAGvBQ"
 TEA_CONSENT = "YJGACwhN0St"       # TRUE_ONLY
@@ -451,6 +451,34 @@ def set_attr(attrs: List[Dict[str, Any]], uid: str, value: Any, display_name: Op
             a["valueType"] = value_type
 
 
+# Formats the DoB may arrive in; the first one is what the target expects
+DOB_INPUT_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y")
+
+def normalise_dob(tei: dict) -> None:
+    """
+    Rewrite the DoB attribute to yyyy-mm-dd when it is stored in another format
+    (e.g. dd/mm/yyyy), which the target rejects with `value_not_valid_age`.
+    Leaves the value untouched if it is already valid or cannot be parsed.
+    """
+    a = get_attr(tei.get("attributes", []), TEA_PATIENT_DOB)
+    if not a or not a.get("value"):
+        return
+    raw = str(a["value"]).strip()
+    # Tolerate ISO timestamps such as 1980-05-17T00:00:00.000
+    candidate = raw.split("T", 1)[0]
+    for fmt in DOB_INPUT_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(candidate, fmt).date()
+        except ValueError:
+            continue
+        iso = parsed.isoformat()
+        if iso != raw:
+            a["value"] = iso
+            print(f"  - Normalised DoB on TEI {tei.get('trackedEntity')}: {raw} -> {iso}")
+        return
+    print(f"  - WARNING: unrecognised DoB '{raw}' on TEI {tei.get('trackedEntity')}, left as-is")
+
+
 def drop_events_missing_bp(tei: dict):
     """
     For each enrollment/event, drop the event if it does not contain BOTH required BP DEs
@@ -746,6 +774,9 @@ def main():
 
                 # Anonymise / fix attributes
                 anonymise_attrs(tei, fake)
+
+                # Convert DoB from dd/mm/yyyy (and similar) to yyyy-mm-dd
+                normalise_dob(tei)
 
                 # Drop events with any BP readings missing
                 # drop_events_missing_bp(tei)
