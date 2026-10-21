@@ -174,6 +174,20 @@ def plan_changes(layout_entries, sections, restore_missing_fields):
     return entries, added, moved, dropped
 
 
+def sort_sections(entries, sections):
+    """
+    Order the layout by the stage's own sortOrder, which is the order the form
+    editor would write and the order Maintenance shows. The layout order is
+    what Capture renders, and it does not have to agree with sortOrder: it is
+    whatever the editor last saved. Returns (entries, changed).
+    """
+    order = {section['id']: section['sortOrder'] for section in sections}
+    # A section no longer in the metadata keeps its place at the end; sorted()
+    # is stable, so entries that tie hold their relative order.
+    ordered = sorted(entries, key=lambda e: order.get(e['id'], len(order) + 1))
+    return ordered, [e['id'] for e in ordered] != [e['id'] for e in entries]
+
+
 def report(stage, sections, layout_entries, added, moved, dropped):
     meta = {s['id']: s for s in sections}
     logger.info(f"Stage {stage}: {len(sections)} section(s) in metadata, "
@@ -220,6 +234,8 @@ def main():
                         help='Credential prefix in .env naming the instance to act on (default: %(default)s).')
     parser.add_argument('--stage', action='append', default=None,
                         help='Program stage UID to reconcile. Repeatable. Default: every stage already in the layout.')
+    parser.add_argument('--sort-sections', action='store_true',
+                        help="Reorder the layout to the stage's own sortOrder. The layout order is what Capture renders and need not agree with sortOrder.")
     parser.add_argument('--restore-missing-fields', action='store_true',
                         help="Also add back data elements that are in a section's metadata but have no field in the layout.")
     parser.add_argument('--confirm', default=None,
@@ -254,7 +270,16 @@ def main():
             new_layout[stage], sections, args.restore_missing_fields)
         report(stage, sections, new_layout[stage], added, moved, dropped)
 
-        if added or moved or (dropped and args.restore_missing_fields):
+        reordered = False
+        if args.sort_sections:
+            before_order = [e['id'] for e in entries]
+            entries, reordered = sort_sections(entries, sections)
+            if reordered:
+                logger.info(f"REORDER sections to the stage's sortOrder:")
+                logger.info(f"    was: {before_order}")
+                logger.info(f"    now: {[e['id'] for e in entries]}")
+
+        if added or moved or reordered or (dropped and args.restore_missing_fields):
             new_layout[stage] = entries
             changed = True
         else:
