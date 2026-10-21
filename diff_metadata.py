@@ -451,6 +451,16 @@ def service_state(side_a, side_b):
 # one is not realistic, so each difference is tagged and the selection file
 # carries a per-theme action as well as a per-object one.
 BMI_BOUNDARY = re.compile(r'#\{[^}]*bmi[^}]*\}\s*<=?\s*35', re.IGNORECASE)
+# The two instances model smoking differently, and deliberately: sandbox 3 asks
+# it once at enrolment as the tracked entity attribute A{smoking}, staging asks
+# it at every visit as the data element #{WGKAijL898k} and 47 of its 67 risk
+# rules were rewritten to read that instead. Both rule sets are internally
+# consistent. Moving any one of these objects without the other 47 rules would
+# leave an instance half-migrated, with risk rules reading a value nothing
+# fills, so the whole theme is never actioned in bulk. Decided 2026-10-21:
+# sandbox 3 stays on the attribute.
+SMOKING_DATA_ELEMENT = 'WGKAijL898k'
+SMOKING_RULE_VARIABLE = 'UqlYsRxirYA'
 # Blood pressure thresholds as they are written in indicator names, e.g.
 # "<140/90", ">=130/80".
 THRESHOLD = re.compile(r'(\d{2,3})\s*/\s*(\d{2,3})')
@@ -500,6 +510,13 @@ def classify(entry):
 
     if entry.get('disabled_a') or entry.get('disabled_b'):
         return 'rule-service-state'
+
+    # Checked before the threshold themes: a risk rule carries both a blood
+    # pressure comparison and the smoking test, and of the two it is mixing
+    # the smoking models that breaks an instance outright.
+    if SMOKING_DATA_ELEMENT in json.dumps(entry) or \
+            entry['uid'] == SMOKING_RULE_VARIABLE:
+        return 'smoking-model'
 
     # The same UID carrying a different blood pressure threshold on each side.
     # This is not a rename: it means the two instances disagree about what the
@@ -568,9 +585,13 @@ def classify(entry):
 
 # Themes that must not be actioned in bulk, whatever the reviewer sets on the
 # group: each object has to be decided on its own.
-NEVER_BULK = set()
+NEVER_BULK = {'smoking-model'}
 
 SUGGESTION = {
+    'smoking-model': 'skip  (deliberate: sandbox 3 asks smoking once as '
+                     'A{smoking}, staging asks it per visit as '
+                     '#{WGKAijL898k}; decided 2026-10-21 that sandbox 3 stays '
+                     'on the attribute)',
     'bp-threshold': 'a_to_b  (sandbox 3 is the reference for 140/90 and '
                     '130/80; it overrides staging)',
     'bp-superseded-on-b': "delete_b  (staging's parallel 'Egypt target' set is "

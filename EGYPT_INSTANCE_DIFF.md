@@ -91,6 +91,34 @@ so a change of definition cannot hide inside a filter that also carries an
 intended fix. Four program indicators were initially mis-filed under
 `active-patient-filter` for exactly that reason.
 
+### The smoking model
+
+The same shape of difference, decided the other way. Smoking feeds the
+cardiovascular risk rules, and the two instances ask for it differently:
+
+- **sandbox 3** asks it once at enrolment, as the tracked entity attribute
+  behind `A{smoking}`.
+- **staging** asks it at every visit, as the data element `WGKAijL898k`
+  (HTN/DM - Smoking at this visit, BOOLEAN, created 2026-10-18) with the rule
+  variable `UqlYsRxirYA` bound to it, and rewrote 47 of its 67
+  `HTN - Risk = *` rules to gate on `d2:hasValue(#{WGKAijL898k})` and compare
+  `#{WGKAijL898k} == false`.
+
+Both rule sets are internally consistent: neither instance has a risk rule
+reading a variable it does not define. The data element is also the only
+difference left between the two Capture form layouts, since staging carries it
+as a fourth field in the BMI section.
+
+**Decision taken 2026-10-21: sandbox 3 stays on the attribute.** Nothing was
+applied. Copying the data element alone would change nothing there, because no
+rule on sandbox 3 reads it; copying a few of the rules would leave risk rules
+gating on a value nothing fills. The theme is `smoking-model`, it is in
+`NEVER_BULK`, and its suggestion is `skip`, so a theme-level action cannot
+sweep it up and each object would have to be set on its own. It is classified
+before the threshold themes, because a risk rule carries both a blood pressure
+comparison and the smoking test and mixing the smoking models is the worse of
+the two failures.
+
 ### Rules out of service
 
 A program rule has no enabled flag in 2.42. One is taken out of service by
@@ -154,13 +182,17 @@ mismapping rather than two UIDs for one concept: a glucose reading around 140
 to 200 was reaching an input expecting cholesterol around 3 to 7. Corrected on
 sandbox 3 on 2026-10-21; staging was already right.
 
-Two differences are left deliberately:
+The layout order is what Capture renders and need not agree with the stage's
+`sortOrder` - it is whatever the editor last saved. Staging drew BMI first
+while its metadata puts it third, so the same programme read in a different
+order on the two instances. `--sort-sections` puts the layout back in
+`sortOrder`, which is what sandbox 3 already followed; applied to staging on
+2026-10-21.
 
-- The layouts render in a different order. Sandbox 3 follows `sortOrder`;
-  staging puts BMI first, contradicting its own metadata. Cosmetic.
-- Staging's BMI section carries `WGKAijL898k` (HTN/DM - Smoking at this visit),
-  which does not exist on sandbox 3 at all. A metadata gap, not a layout one -
-  copying the layout would reference an object that is not there.
+One difference is left, and it is not a layout one: staging's BMI section
+carries a fourth field, `WGKAijL898k` (HTN/DM - Smoking at this visit), which
+does not exist on sandbox 3 at all. That is the smoking model, above - the BMI
+section itself, with height, weight and BMI, is on both.
 
 `CBkUvBbOIKz` (Statin prescribed?) is in the Statins section in the metadata on
 both instances and in the form on neither, confirmed deliberate. It is listed
