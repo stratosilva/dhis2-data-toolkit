@@ -123,6 +123,50 @@ stage assignment and the rules. In `VALIDATE` mode 13 objects are reported as
 *pending a dependency* — they reference something the same run would create
 earlier, which a validate pass cannot see because nothing is committed.
 
+## The Capture custom form is a separate axis
+
+`diff_metadata.py` compares metadata. It does not look at
+`dataStore/capture/dataEntryForms`, which is where the Capture app keeps the
+custom form layout, and the two drift independently: a section can be correct
+in the metadata on both instances and rendered on neither.
+
+Once a program stage has a layout under that key, Capture renders that layout
+and ignores any section the layout does not mention. The form editor writes
+the layout as it stood when it was last saved, so a section added in
+Maintenance afterwards is in the metadata and never drawn. That is what had
+happened to `kGNeiLAEe5V` (Scheduled next visit) on staging - 8 sections in the
+metadata, 7 in the layout. `fix_capture_form_sections.py --target PREFIX`
+reconciles the two.
+
+A `fieldMap` is access, not rendering. `ProgramStageFactory` builds the mapped
+data elements into the plugin's own config and adds only the plugin to the
+section, so a data element that appears nowhere but a `fieldMap` has no field
+in the form, and the program rules that act on that field have nothing to act
+on. The documented pattern maps fields the form also renders normally. Both
+instances now hold the plugin and the field.
+
+Comparing the two layouts found one real difference beyond that: on sandbox 3
+the CVD risk plugin read `totalCholesterol` from `LktTflPfk1z`, which is
+**HTN - Blood sugar reading: PPBS (mg/dL)**, not `pSqsIKFb8NX`
+(HTN - Total Cholesterol (mmol/L)). Both data elements exist on both instances
+and both run cvd-risk-plugin 1.0.0 with identical code, so this was a
+mismapping rather than two UIDs for one concept: a glucose reading around 140
+to 200 was reaching an input expecting cholesterol around 3 to 7. Corrected on
+sandbox 3 on 2026-10-21; staging was already right.
+
+Two differences are left deliberately:
+
+- The layouts render in a different order. Sandbox 3 follows `sortOrder`;
+  staging puts BMI first, contradicting its own metadata. Cosmetic.
+- Staging's BMI section carries `WGKAijL898k` (HTN/DM - Smoking at this visit),
+  which does not exist on sandbox 3 at all. A metadata gap, not a layout one -
+  copying the layout would reference an object that is not there.
+
+`CBkUvBbOIKz` (Statin prescribed?) is in the Statins section in the metadata on
+both instances and in the form on neither, confirmed deliberate. It is listed
+in `DELIBERATELY_OMITTED` so the reconciler reports it as intentional and
+`--restore-missing-fields` leaves it alone.
+
 ## Preflight
 
 `preflight_target.py --target PREFIX` stays the quick read-only check that an
