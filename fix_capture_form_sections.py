@@ -21,7 +21,8 @@ This script compares the stored layout against programStageSections and:
     section's own data elements as fields;
   * moves a plugin into that section when every data element in the plugin's
     fieldMap belongs to it, so the widget lands under its own heading instead
-    of the section it was parked in;
+    of the section it was parked in, while still giving the data element a
+    field of its own - a fieldMap is access, not rendering;
   * reports data elements that are in a section's metadata but absent from the
     layout. Those are left alone - dropping a field from a custom form is
     something the form editor lets you do on purpose, and the ones already
@@ -84,6 +85,18 @@ def plugin_targets(element):
 
 
 def field_ids(entry):
+    """
+    The data elements this section renders as inputs.
+
+    Plugin elements are deliberately not counted. A fieldMap grants the plugin
+    access to a data element, it does not draw it: ProgramStageFactory builds
+    the mapped data elements into the plugin's own config and adds only the
+    plugin to the section. The documented pattern (capture-app
+    docs/developer/form-field-plugins/manual-setup.md) maps fields the form
+    also renders normally. A data element that appears only in a fieldMap has
+    no field in the form, and program rules that act on that field - hide it,
+    assign to it, warn on it - have nothing to act on.
+    """
     return [e['id'] for e in entry['elements'] if e.get('type') != 'plugin']
 
 
@@ -105,7 +118,7 @@ def plan_changes(layout_entries, sections, restore_missing_fields):
 
         # A plugin already carrying every data element of this section belongs
         # under this section's heading, not wherever the editor left it.
-        claimed = set()
+        plugins = []
         for entry in entries:
             for element in list(entry['elements']):
                 if element.get('type') != 'plugin':
@@ -114,12 +127,11 @@ def plan_changes(layout_entries, sections, restore_missing_fields):
                 if targets and set(targets) <= set(section_des):
                     entry['elements'].remove(element)
                     moved.append((element['id'], entry['id'], section['id']))
-                    claimed.update(targets)
-                    section.setdefault('_plugins', []).append(element)
+                    plugins.append(element)
 
-        elements = [{'id': de, 'type': FIELD_TYPE}
-                    for de in section_des if de not in claimed]
-        elements += section.pop('_plugins', [])
+        # A data element stays a field of its own even when a plugin maps it:
+        # see field_ids() on why a fieldMap is not a rendering.
+        elements = plugins + [{'id': de, 'type': FIELD_TYPE} for de in section_des]
 
         new_entry = {'id': section['id'], 'elements': elements}
 
@@ -140,17 +152,24 @@ def plan_changes(layout_entries, sections, restore_missing_fields):
         if not section:
             continue
         shown = set(field_ids(entry))
-        for element in entry['elements']:
-            if element.get('type') == 'plugin':
-                shown.update(plugin_targets(element))
+        meta_order = [d['id'] for d in section['dataElements']]
         absent = [d for d in section['dataElements']
                   if d['id'] not in shown and d['id'] not in DELIBERATELY_OMITTED]
         for data_element in absent:
             dropped.append((section, data_element))
-            if restore_missing_fields:
-                position = [d['id'] for d in section['dataElements']].index(data_element['id'])
-                entry['elements'].insert(min(position, len(entry['elements'])),
-                                         {'id': data_element['id'], 'type': FIELD_TYPE})
+            if not restore_missing_fields:
+                continue
+            # Slot it among the fields in metadata order, leaving the plugins
+            # where they are rather than reshuffling a section that works.
+            rank = meta_order.index(data_element['id'])
+            index = len(entry['elements'])
+            for position, element in enumerate(entry['elements']):
+                if element.get('type') == 'plugin' or element['id'] not in meta_order:
+                    continue
+                if meta_order.index(element['id']) > rank:
+                    index = position
+                    break
+            entry['elements'].insert(index, {'id': data_element['id'], 'type': FIELD_TYPE})
 
     return entries, added, moved, dropped
 
