@@ -33,6 +33,7 @@ Writes a CSV summary to: sync_results.csv
 import argparse
 import csv
 import os
+import re
 import sys
 from typing import Dict, Any, List, Optional
 import gc
@@ -73,6 +74,13 @@ TEA_CONSENT = "YJGACwhN0St"       # TRUE_ONLY
 DE_DROP_SET = {"ifRI6qw96v4", "mOMHtDNHmDA", "XMtcYl6Y3Jp", "yc3PVWG7ilA", "gghaVrBpTgl"}
 HTN_VISIT_STAGE = "anb2cjLx3WM"  # only strip for this stage
 
+
+# The target's option set for HTN - MED - Hydrochlorothiazide only carries the
+# 25mg code, so a 12.5mg value fails the whole event on import. The target has
+# no option set on "Other hypertension medication", so the value moves there.
+DE_HCTZ = "D8FWXAtCuL2"
+DE_OTHER_HTN_MED = "drY9ZQ0PEEw"
+HCTZ_UNSUPPORTED_CODE = "HYDROCHLOROTHIAZIDE_12POINT5MG"
 
 DE_BP_DIASTOLIC = "yNhtHKtKkO1"
 DE_BP_SYSTOLIC  = "IxEwYiq1FTq"
@@ -495,31 +503,124 @@ def set_attr(attrs: List[Dict[str, Any]], uid: str, value: Any, display_name: Op
 
 
 # Formats the DoB may arrive in; the first one is what the target expects
-DOB_INPUT_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y")
+DOB_INPUT_FORMATS = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d")
+
+# Roughly a third of source records store an age ("60", "55yrs") in the date of
+# birth field, and the target rejects those with `value_not_valid_age`. An age
+# only pins down the year, so anchor it to 1 January: re-running the sync later
+# then produces the same date, which "today minus N years" would not.
+MAX_PLAUSIBLE_AGE = 120
+EARLIEST_BIRTH_YEAR = 1900
+
+AGE_PATTERN = re.compile(r"(\d{1,3})\s*(?:y|yr|yrs|year|years)?", re.IGNORECASE)
+YEAR_PATTERN = re.compile(r"\d{4}")
+
+
+def _tidy_dob_text(raw: str) -> str:
+    """Strip the punctuation and spacing noise seen in the source data."""
+    # Tolerate ISO timestamps such as 1980-05-17T00:00:00.000
+    text = raw.split("T", 1)[0].strip()
+    # Typos where a separator was meant: '12/07)1976'
+    text = re.sub(r"[)(\\]", "/", text)
+    # Spaces around separators: '04/ 06/ 1976', '19 /2/ 1966'
+    text = re.sub(r"\s*([/.-])\s*", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _year_to_iso(year: int) -> Optional[str]:
+    """A bare year of birth is only good to the year, so anchor it to 1 January."""
+    if EARLIEST_BIRTH_YEAR <= year <= date.today().year:
+        return "%04d-01-01" % year
+    return None
+
+
+def dob_to_iso(raw: str) -> Optional[str]:
+    """
+    Best-effort yyyy-mm-dd for one raw DoB value, or None if it is not
+    recognisable. Kept separate from normalise_dob so it can be tested directly.
+    """
+    text = _tidy_dob_text(raw)
+    if not text:
+        return None
+
+    for fmt in DOB_INPUT_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+
+    # An age, with or without a unit suffix: '24', '55yrs', '100 yrs'
+    match = AGE_PATTERN.fullmatch(text)
+    if match:
+        age = int(match.group(1))
+        if 0 < age <= MAX_PLAUSIBLE_AGE:
+            return "%04d-01-01" % (date.today().year - age)
+
+    # A bare year of birth: '1974'
+    if YEAR_PATTERN.fullmatch(text):
+        return _year_to_iso(int(text))
+
+    return None
+
 
 def normalise_dob(tei: dict) -> None:
     """
     Rewrite the DoB attribute to yyyy-mm-dd when it is stored in another format
-    (e.g. dd/mm/yyyy), which the target rejects with `value_not_valid_age`.
-    Leaves the value untouched if it is already valid or cannot be parsed.
+    (e.g. dd/mm/yyyy, or an age), which the target rejects with
+    `value_not_valid_age`. Leaves the value untouched if it cannot be parsed.
     """
     a = get_attr(tei.get("attributes", []), TEA_PATIENT_DOB)
     if not a or not a.get("value"):
         return
     raw = str(a["value"]).strip()
-    # Tolerate ISO timestamps such as 1980-05-17T00:00:00.000
-    candidate = raw.split("T", 1)[0]
-    for fmt in DOB_INPUT_FORMATS:
-        try:
-            parsed = datetime.datetime.strptime(candidate, fmt).date()
-        except ValueError:
-            continue
-        iso = parsed.isoformat()
-        if iso != raw:
-            a["value"] = iso
-            print(f"  - Normalised DoB on TEI {tei.get('trackedEntity')}: {raw} -> {iso}")
+    iso = dob_to_iso(raw)
+    if iso is None:
+        print(f"  - WARNING: unrecognised DoB '{raw}' on TEI {tei.get('trackedEntity')}, left as-is")
         return
-    print(f"  - WARNING: unrecognised DoB '{raw}' on TEI {tei.get('trackedEntity')}, left as-is")
+    if iso != raw:
+        a["value"] = iso
+        print(f"  - Normalised DoB on TEI {tei.get('trackedEntity')}: {raw} -> {iso}")
+
+
+def remap_unsupported_hctz(tei: dict) -> int:
+    """
+    Move HYDROCHLOROTHIAZIDE_12POINT5MG off the Hydrochlorothiazide data element
+    and into the free-text "Other hypertension medication" one, which carries no
+    option set. Returns the number of events changed.
+    """
+    changed = 0
+
+    for enr in tei.get("enrollments", []) or []:
+        for ev in enr.get("events", []) or []:
+            dvs = ev.get("dataValues") or []
+
+            hctz = next(
+                (dv for dv in dvs
+                 if dv.get("dataElement") == DE_HCTZ
+                 and str(dv.get("value") or "").strip() == HCTZ_UNSUPPORTED_CODE),
+                None,
+            )
+            if hctz is None:
+                continue
+
+            dvs.remove(hctz)
+
+            other = next((dv for dv in dvs if dv.get("dataElement") == DE_OTHER_HTN_MED), None)
+            if other is None:
+                dvs.append({"dataElement": DE_OTHER_HTN_MED, "value": HCTZ_UNSUPPORTED_CODE})
+            else:
+                # Append rather than overwrite: whatever the clinician already
+                # recorded as the other medication still matters.
+                existing = str(other.get("value") or "").strip()
+                if not existing:
+                    other["value"] = HCTZ_UNSUPPORTED_CODE
+                elif HCTZ_UNSUPPORTED_CODE not in existing:
+                    other["value"] = f"{existing}; {HCTZ_UNSUPPORTED_CODE}"
+
+            ev["dataValues"] = dvs
+            changed += 1
+
+    return changed
 
 
 def drop_events_missing_bp(tei: dict):
@@ -842,6 +943,12 @@ def main():
                 # Clean invalid DEs first (your existing function)
                 strip_invalid_data_elements(tei)
 
+                # Move the 12.5mg HCTZ code the target does not accept
+                moved = remap_unsupported_hctz(tei)
+                if moved:
+                    print(f"  - Moved {HCTZ_UNSUPPORTED_CODE} to Other hypertension "
+                          f"medication on {moved} event(s) of TEI {tei.get('trackedEntity')}")
+
                 if args.map_to_ou:
                     # ---- MAPPING MODE (only when --map-to-ou is provided) ----
                     # 1) Force orgUnit everywhere to the target OU
@@ -880,19 +987,7 @@ def main():
                     # We just post the cleaned TEI as-is.
                     pass
 
-                # 6) POST to target
-                payload = {"trackedEntities": [tei]}
-                resp = tgt.post(
-                    "tracker",
-                    params={
-                        "async": "false",
-                        "importStrategy": "CREATE_AND_UPDATE",
-                        "skipRuleEngine": "false",
-                    },
-                    json=payload,
-                )
-
-                # POST one-by-one to target
+                # 6) POST to target, one TEI at a time
                 payload = {"trackedEntities": [tei]}
                 try:
                     resp = tgt.post(
