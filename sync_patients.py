@@ -4,8 +4,20 @@
 """
 Sync + anonymise TEIs from a source DHIS2 instance to a target DHIS2 instance.
 
-Usage:
-  python sync_anonymised_teis.py \
+Server URLs, usernames and passwords come from the .env file at the repository
+root (see dhis2_env.py). By default this syncs Nigeria production into sandbox 1:
+
+  python sync_patients.py --page-size 50 --updated-offset-days 7
+
+Pass --source / --target to sync between different .env prefixes:
+
+  python sync_patients.py --source NIGERIA_NCD --target EGYPT_SANDBOX3
+
+The individual --source-url / --source-user / --source-pass flags (and their
+--target- counterparts) still work and override .env, so a one-off server needs
+no .env entry:
+
+  python sync_patients.py \
       --source-url https://SOURCE/dhis \
       --source-user user --source-pass pass \
       --target-url https://TARGET/dhis \
@@ -33,6 +45,8 @@ from datetime import date, timedelta
 
 import requests
 from faker import Faker
+
+from dhis2_env import credentials
 
 import json
 import datetime
@@ -70,6 +84,35 @@ TEA_HTN_YN = "jCRIT4GMMOS"   # "HTN - Does patient have hypertension?"
 TEA_DROP_VALUE_ATTR = "ea5w3mkinZo"
 
 REQUIRED_ATTRS = {TEA_PATIENT_DOB, TEA_PATIENT_NAME, TEA_SEX}  # DoB, Patient name, Sex
+
+# ---- Credentials ----
+# .env prefixes this script syncs between by default: Nigeria production is the
+# source, sandbox 1 the target. NIGERIA_NCD is the prefix move_patients.py
+# already reads, so the production password stays in exactly one place.
+DEFAULT_SOURCE_PREFIX = "NIGERIA_NCD"
+DEFAULT_TARGET_PREFIX = "SANDBOX1"
+
+
+def resolve_server(role, prefix, url, username, password):
+    """
+    Resolve one end of the sync to (url, username, password).
+
+    Explicit flags win; whatever is left unset comes from the .env prefix.
+    Supplying all three flags means .env is never read, so the script still
+    runs against a one-off server on a machine that has no .env.
+    """
+    if url and username and password:
+        return url, username, password
+
+    try:
+        env_url, env_username, env_password = credentials(prefix)
+    except (FileNotFoundError, KeyError) as exc:
+        detail = exc.args[0] if exc.args else exc
+        print(f"ERROR: cannot resolve the {role} server: {detail}", file=sys.stderr)
+        sys.exit(2)
+
+    return url or env_url, username or env_username, password or env_password
+
 
 # ---- HTTP client ----
 class DHIS2:
@@ -693,12 +736,16 @@ def summarize_error_notes(result_json: Dict[str, Any]) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Fetch TEIs from source DHIS2, anonymise, and post to target DHIS2.")
-    ap.add_argument("--source-url", required=True)
-    ap.add_argument("--source-user", required=True)
-    ap.add_argument("--source-pass", required=True)
-    ap.add_argument("--target-url", required=True)
-    ap.add_argument("--target-user", required=True)
-    ap.add_argument("--target-pass", required=True)
+    ap.add_argument("--source", default=DEFAULT_SOURCE_PREFIX, metavar="PREFIX",
+                    help=f".env prefix for the source server (default: {DEFAULT_SOURCE_PREFIX})")
+    ap.add_argument("--target", default=DEFAULT_TARGET_PREFIX, metavar="PREFIX",
+                    help=f".env prefix for the target server (default: {DEFAULT_TARGET_PREFIX})")
+    ap.add_argument("--source-url", help="Override the source URL from .env")
+    ap.add_argument("--source-user", help="Override the source username from .env")
+    ap.add_argument("--source-pass", help="Override the source password from .env")
+    ap.add_argument("--target-url", help="Override the target URL from .env")
+    ap.add_argument("--target-user", help="Override the target username from .env")
+    ap.add_argument("--target-pass", help="Override the target password from .env")
     ap.add_argument("--program", default=PROGRAM_UID)
     ap.add_argument("--org-unit", default=DEFAULT_ORG_UNIT)
     ap.add_argument("--page-size", type=int, default=50)
@@ -716,8 +763,16 @@ def main():
     fake = Faker()
     Faker.seed(args.seed)
 
-    src = DHIS2(args.source_url, args.source_user, args.source_pass, verify=not args.insecure)
-    tgt = DHIS2(args.target_url, args.target_user, args.target_pass, verify=not args.insecure)
+    args.source_url, source_user, source_pass = resolve_server(
+        "source", args.source, args.source_url, args.source_user, args.source_pass)
+    args.target_url, target_user, target_pass = resolve_server(
+        "target", args.target, args.target_url, args.target_user, args.target_pass)
+
+    print(f"Source: {args.source_url}")
+    print(f"Target: {args.target_url}")
+
+    src = DHIS2(args.source_url, source_user, source_pass, verify=not args.insecure)
+    tgt = DHIS2(args.target_url, target_user, target_pass, verify=not args.insecure)
 
     # If mapping is requested, verify the OU exists on TARGET once (fail fast if not)
 
