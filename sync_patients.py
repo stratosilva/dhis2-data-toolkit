@@ -71,7 +71,8 @@ TEA_SUPPORTER_NAME = "JO6OoiD83nH"
 TEA_SUPPORTER_PHONE = "JUWgfAAGvBQ"
 TEA_CONSENT = "YJGACwhN0St"       # TRUE_ONLY
 # --- DataElements to drop from events (invalid / not in stage) ---
-DE_DROP_SET = {"ifRI6qw96v4", "mOMHtDNHmDA", "XMtcYl6Y3Jp", "yc3PVWG7ilA", "gghaVrBpTgl"}
+DE_DROP_SET = {"ifRI6qw96v4", "mOMHtDNHmDA", "XMtcYl6Y3Jp", "yc3PVWG7ilA", "gghaVrBpTgl",
+                "CZPgB1WuEp0", "DRDE9Zug3bi"}
 HTN_VISIT_STAGE = "anb2cjLx3WM"  # only strip for this stage
 
 
@@ -92,6 +93,141 @@ TEA_HTN_YN = "jCRIT4GMMOS"   # "HTN - Does patient have hypertension?"
 TEA_DROP_VALUE_ATTR = "ea5w3mkinZo"
 
 REQUIRED_ATTRS = {TEA_PATIENT_DOB, TEA_PATIENT_NAME, TEA_SEX}  # DoB, Patient name, Sex
+
+# ---- Program rule guard ----
+# Some target rules reject an incoming value outright: the AUTOFILL rule on
+# NCD Patient Status refuses anything that is not its own calculated ACTIVE.
+# Prefixing the condition with "false && " parks the rule for the duration of a
+# run. The original condition is restored in a finally block, and is also
+# written to disk first so a hard kill still leaves a record to restore from.
+RULE_GUARD_PREFIX = "false && "
+RULE_BACKUP_PATH = "program_rule_backup.json"
+
+
+def disable_program_rules(api: "DHIS2", rule_uids: List[str]) -> Dict[str, str]:
+    """
+    Park each rule by prefixing its condition, returning {uid: original condition}.
+    Raises if a rule cannot be read or written, because running on with a rule
+    half-disabled would be worse than not running at all.
+    """
+    if not rule_uids:
+        return {}
+
+    saved: Dict[str, str] = {}
+
+    for uid in rule_uids:
+        r = api.get(f"programRules/{uid}", params={"fields": ":owner"})
+        if r.status_code != 200:
+            raise RuntimeError(f"Cannot read programRule {uid} (HTTP {r.status_code}): {r.text[:200]}")
+
+        rule = r.json()
+        original = rule.get("condition", "")
+
+        if original.startswith(RULE_GUARD_PREFIX):
+            print(f"  - programRule {uid} is already parked, leaving it alone")
+            continue
+
+        saved[uid] = original
+
+        # Record the originals BEFORE touching the server, so a hard kill
+        # (which skips the finally block) still leaves them recoverable.
+        with open(RULE_BACKUP_PATH, "w", encoding="utf-8") as f:
+            json.dump(saved, f, indent=2)
+
+        rule["condition"] = RULE_GUARD_PREFIX + original
+        w = api.put(f"programRules/{uid}", json=rule)
+        if w.status_code not in (200, 201):
+            del saved[uid]
+            raise RuntimeError(f"Cannot park programRule {uid} (HTTP {w.status_code}): {w.text[:300]}")
+
+        print(f"  - Parked programRule {uid}: {original!r} -> {rule['condition']!r}")
+
+    return saved
+
+
+def restore_program_rules(api: "DHIS2", saved: Dict[str, str]) -> None:
+    """Put every parked rule back. Never raises: it runs from a finally block."""
+    if not saved:
+        return
+
+    still_broken = {}
+
+    for uid, original in saved.items():
+        try:
+            r = api.get(f"programRules/{uid}", params={"fields": ":owner"})
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code} reading it back")
+
+            rule = r.json()
+            rule["condition"] = original
+            w = api.put(f"programRules/{uid}", json=rule)
+            if w.status_code not in (200, 201):
+                raise RuntimeError(f"HTTP {w.status_code}: {w.text[:200]}")
+
+            print(f"  - Restored programRule {uid} to {original!r}")
+        except Exception as exc:
+            still_broken[uid] = original
+            print(f"!! FAILED to restore programRule {uid}: {exc}", file=sys.stderr)
+            print(f"!! Its condition must be set back to {original!r} by hand.", file=sys.stderr)
+
+    if still_broken:
+        with open(RULE_BACKUP_PATH, "w", encoding="utf-8") as f:
+            json.dump(still_broken, f, indent=2)
+        print(f"!! {len(still_broken)} rule(s) left parked; originals are in {RULE_BACKUP_PATH}",
+              file=sys.stderr)
+    elif os.path.exists(RULE_BACKUP_PATH):
+        os.remove(RULE_BACKUP_PATH)
+
+
+# ---- Selected-UID source ----
+def load_uid_list(path: str) -> List[str]:
+    """Read TEI UIDs from a results CSV (its 'uid' column) or a plain UID per line."""
+    uids: List[str] = []
+    seen = set()
+
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        sample = f.read(2048)
+        f.seek(0)
+
+        if "," in sample and "uid" in sample.split("\n", 1)[0]:
+            for row in csv.DictReader(f):
+                uid = (row.get("uid") or "").strip()
+                if uid and uid not in seen:
+                    seen.add(uid)
+                    uids.append(uid)
+        else:
+            for line in f:
+                uid = line.strip()
+                if uid and not uid.startswith("#") and uid not in seen:
+                    seen.add(uid)
+                    uids.append(uid)
+
+    return uids
+
+
+def iter_selected_teis(src: "DHIS2", uids: List[str], program_uid: str, page_size: int = 50):
+    """
+    Yield (page_number, page_items, pager) for an explicit list of TEI UIDs,
+    matching iter_source_teis so the import loop does not care which it got.
+    """
+    fields = "trackedEntity,trackedEntityType,orgUnit,attributes,enrollments[*,!attributes]"
+    total_pages = (len(uids) + page_size - 1) // page_size
+
+    for index in range(0, len(uids), page_size):
+        chunk = uids[index:index + page_size]
+        page_no = index // page_size + 1
+        items = []
+
+        for uid in chunk:
+            r = src.get(f"tracker/trackedEntities/{uid}",
+                        params={"program": program_uid, "fields": fields})
+            if r.status_code == 200:
+                items.append(r.json())
+            else:
+                print(f"  - SKIP {uid}: source fetch returned HTTP {r.status_code}")
+
+        yield page_no, items, {"page": page_no, "pageCount": total_pages}
+
 
 # ---- Credentials ----
 # .env prefixes this script syncs between by default: Nigeria production is the
@@ -154,7 +290,9 @@ class DHIS2:
                 if method == "GET":
                     resp = self.s.get(url, params=params, timeout=self.timeout)
                 else:
-                    resp = self.s.post(url, params=params, json=json, timeout=self.timeout)
+                    # Dispatch on the verb: PUT must not be sent as a POST.
+                    resp = self.s.request(method, url, params=params, json=json,
+                                          timeout=self.timeout)
             except (ConnectionError, ReadTimeout, ProtocolError, RemoteDisconnected, ChunkedEncodingError) as e:
                 if attempt >= max_attempts:
                     raise
@@ -188,6 +326,10 @@ class DHIS2:
 
     def get(self, path: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
         return self._req_with_retry("GET", path, params=params, max_attempts=self.max_attempts_get)
+
+    def put(self, path: str, params: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None) -> requests.Response:
+        return self._req_with_retry("PUT", path, params=params, json=json,
+                                    max_attempts=self.max_attempts_post)
 
     def post(self, path: str, params: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None) -> requests.Response:
         return self._req_with_retry("POST", path, params=params, json=json, max_attempts=self.max_attempts_post)
@@ -856,6 +998,13 @@ def main():
     ap.add_argument("--map-to-ou", dest="map_to_ou", default=None,
                     help = "If provided, remap the orgUnit everywhere in the TEI payload (root, enrollments, and events) "
                            "to this OU UID. This OU must exist on the TARGET server.")
+    ap.add_argument("--only-uids", dest="only_uids", default=None, metavar="FILE",
+                    help="Sync only the TEI UIDs listed in FILE (a results CSV with a 'uid' "
+                         "column, or one UID per line) instead of streaming the whole program.")
+    ap.add_argument("--disable-rule", dest="disable_rules", action="append", default=[],
+                    metavar="UID",
+                    help="Park this programRule on the TARGET for the duration of the run by "
+                         "prefixing its condition with 'false && ', then restore it. Repeatable.")
     ap.add_argument("--mapping-csv", dest="mapping_csv", default="ou_uid_mapping.csv",
                     help="Path to local CSV with persistent mappings of TEI uids per OU (avoid creating duplicates when"
                          "mapping to another OU)")
@@ -899,10 +1048,20 @@ def main():
 
     total_processed = 0
 
+    saved_rules = disable_program_rules(tgt, args.disable_rules)
+
     try:
-        print(f"Streaming TEIs from source in pages of {args.page_size}...")
-        for page_no, teis, pager in iter_source_teis(src, args.program, args.org_unit, page_size=args.page_size,
-                                                     updated_offset_days=args.updated_offset_days):
+        if args.only_uids:
+            selected = load_uid_list(args.only_uids)
+            print(f"Syncing {len(selected)} selected TEIs from {args.only_uids} "
+                  f"in pages of {args.page_size}...")
+            source_pages = iter_selected_teis(src, selected, args.program, page_size=args.page_size)
+        else:
+            print(f"Streaming TEIs from source in pages of {args.page_size}...")
+            source_pages = iter_source_teis(src, args.program, args.org_unit, page_size=args.page_size,
+                                            updated_offset_days=args.updated_offset_days)
+
+        for page_no, teis, pager in source_pages:
             print(f"Page {pager.get('page', page_no)}: {len(teis)} TEIs")
 
             for tei in teis:
@@ -1044,6 +1203,7 @@ def main():
 
     finally:
         csv_f.close()
+        restore_program_rules(tgt, saved_rules)
 
 if __name__ == "__main__":
     try:
