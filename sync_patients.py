@@ -186,10 +186,12 @@ def load_uid_list(path: str) -> List[str]:
     seen = set()
 
     with open(path, "r", encoding="utf-8", newline="") as f:
-        sample = f.read(2048)
+        # Detect the header from the first line alone. Testing for a comma missed
+        # a single-column file, whose "uid" header was then read as a UID.
+        header = [field.strip().lower() for field in f.readline().split(",")]
         f.seek(0)
 
-        if "," in sample and "uid" in sample.split("\n", 1)[0]:
+        if "uid" in header:
             for row in csv.DictReader(f):
                 uid = (row.get("uid") or "").strip()
                 if uid and uid not in seen:
