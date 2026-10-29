@@ -129,24 +129,24 @@ def find_candidates(api, program, stage, org_units, period_start, period_end,
         and datetime.strptime(e['scheduledAt'][:10], '%Y-%m-%d').date() <= period_end
     ]
 
-    # One candidate per patient. Real data is not tidy: the demo instance has
-    # patients carrying four open appointments, some more than a year old.
-    # Without this a patient with four would be given four visits in one run,
-    # all dated inside the same period. The latest due date wins, because that
-    # is the appointment they were actually waiting on.
+    # One open appointment per patient is the rule this data is meant to keep:
+    # a patient is waiting on exactly one visit, upcoming or overdue. Real data
+    # is not always tidy - the demo instance has patients carrying four open
+    # appointments, some more than a year old - and a top-up cannot tidy them.
+    # Recycling one of the four still leaves three open and books a fourth, so
+    # these are left alone and reported instead of being quietly made worse.
     by_patient = {}
     for event in eligible:
-        te = event['trackedEntity']
-        current = by_patient.get(te)
-        if current is None or event['scheduledAt'] > current['scheduledAt']:
-            by_patient[te] = event
+        by_patient.setdefault(event['trackedEntity'], []).append(event)
 
-    duplicates = len(eligible) - len(by_patient)
-    if duplicates:
-        logger.info(f"  {duplicates} extra open appointment(s) ignored: those "
-                    f"patients had more than one")
+    crowded = {te: events for te, events in by_patient.items() if len(events) > 1}
+    if crowded:
+        logger.warning(
+            f"  {len(crowded)} patient(s) skipped: they hold more than one open "
+            f"appointment ({sum(len(e) for e in crowded.values())} in total), "
+            f"which a top-up cannot resolve. Clear the extras first.")
 
-    candidates = list(by_patient.values())
+    candidates = [events[0] for te, events in by_patient.items() if len(events) == 1]
 
     logger.info(f"  {len(scheduled)} appointment(s) due on or before "
                 f"{period_end.isoformat()}; {len(seen)} patient(s) already seen "
@@ -255,16 +255,25 @@ def build_topup_payload(candidates, previous, build_values, period_start,
     today = date.today()
     next_due = today + timedelta(days=next_interval_days)
     built = 0
+    skipped_not_due = 0
 
     for candidate in candidates:
         te = candidate['trackedEntity']
         due = datetime.strptime(candidate['scheduledAt'][:10], '%Y-%m-%d').date()
+
+        # An appointment that is not due yet has not been missed, and a visit
+        # cannot be recorded against it without dating that visit in the
+        # future. A period ending after today is the only way to get here.
+        if due > today:
+            skipped_not_due += 1
+            continue
 
         if period_start <= due <= period_end:
             visit_date = due
         else:
             span = (period_end - period_start).days
             visit_date = period_start + timedelta(days=random.randint(0, max(span, 0)))
+            visit_date = min(visit_date, today)
 
         values = build_values(te, previous.get(te), visit_date)
         if not values:
@@ -293,6 +302,9 @@ def build_topup_payload(candidates, previous, build_values, period_start,
             'status': 'SCHEDULE',
         })
         built += 1
+
+    if skipped_not_due:
+        logger.info(f"  {skipped_not_due} appointment(s) skipped: not due yet")
 
     return events, built
 

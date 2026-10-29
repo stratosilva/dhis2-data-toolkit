@@ -2684,8 +2684,15 @@ def build_events(profile, dated, org_unit, patient_uid):
         # no due date by design: nothing scheduled it.
         if index > 0:
             previous_visit = datetime.strptime(dated[index - 1][0], "%Y-%m-%d").date()
-            visit['scheduledAt'] = (
-                previous_visit + timedelta(days=SCHEDULED_VISIT_INTERVAL_DAYS)
+            came = datetime.strptime(occurred_date, "%Y-%m-%d").date()
+            # Booked at the previous visit, but never later than the day the
+            # patient actually turned up: a visit cannot still be due after it
+            # has happened. Taking previous + 28 unconditionally gave the
+            # visits that came sooner than that a due date in the future, and
+            # a finished visit carrying a future due date cannot be told apart
+            # from a pending appointment - the patient appeared to have two.
+            visit['scheduledAt'] = min(
+                previous_visit + timedelta(days=SCHEDULED_VISIT_INTERVAL_DAYS), came
             ).isoformat()
 
         events.append(visit)
