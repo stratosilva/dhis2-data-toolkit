@@ -17,6 +17,7 @@ analytics too, so it has to run again after the exchanges write them.
 """
 
 import argparse
+import re
 import subprocess
 import sys
 import time
@@ -32,6 +33,9 @@ TARGET_ENV_PREFIX = 'EGYPT_SANDBOX3'
 # Discovered by name at run time rather than hardcoded: exchange UIDs differ
 # between instances, and running the wrong one silently writes nothing.
 EXCHANGE_NAME_PREFIX = 'ADEX - HTN DM'
+# Where each program indicator records the aggregate data element it
+# feeds, when a request does not name the attribute itself.
+MAPPING_ATTRIBUTE = 'vudyDP7jUy5'
 
 
 def find_exchanges(api):
@@ -110,9 +114,12 @@ def run_exchange(api, uid, name):
     """
     Run one aggregate data exchange.
 
-    The 12-month exchange regularly exceeds the gateway timeout while
-    completing server-side, so a 504 is reported and then verified by looking
-    at the data rather than treated as a failure.
+    The 12-month exchange regularly exceeds the gateway timeout. A 504 means
+    the proxy stopped waiting, which says nothing about whether the job
+    finished, so it is reported and left for verify_aggregates to settle by
+    looking at the data. On sandbox 1 a 504 did mean the job was cut short:
+    every DM request after the timeout was dropped, and the aggregate values
+    for them were never written.
     """
     logger.info(f"  {name} ({uid})")
     try:
@@ -124,11 +131,78 @@ def run_exchange(api, uid, name):
     except DHIS2RequestException as e:
         code = getattr(e, 'code', None)
         if code in (502, 504):
-            logger.warning(f"    gateway {code}: the proxy gave up. The job usually "
-                           f"completes server-side; verified below.")
+            logger.warning(f"    gateway {code}: the proxy gave up. Whether the "
+                           f"job finished is decided by the readback, not here.")
             return True
         logger.error(f"    failed: {str(e)[:200]}")
         return False
+
+
+def verify_aggregates(api):
+    """
+    Read back what the exchanges were supposed to write.
+
+    Without this the rebuild can report success while the aggregate half of
+    every dashboard is empty: a gateway timeout is indistinguishable from a
+    finished job until the data is looked at.
+
+    The data elements are not the UIDs in the exchange requests. Those are
+    program indicators, and each request carries an outputIdScheme of
+    ATTRIBUTE:<uid> naming the metadata attribute in which every indicator
+    records the aggregate data element it feeds.
+    """
+    exchanges = api.get('aggregateDataExchanges', params={
+        'fields': 'name,source[requests[dx,outputIdScheme]]', 'paging': 'false'}
+    ).json()['aggregateDataExchanges']
+
+    indicators, attribute = set(), MAPPING_ATTRIBUTE
+    for exchange in exchanges:
+        if not exchange['name'].startswith(EXCHANGE_NAME_PREFIX):
+            continue
+        for request in exchange['source']['requests']:
+            indicators.update(request['dx'])
+            match = re.fullmatch(r'ATTRIBUTE:(\w{11})', request.get('outputIdScheme') or '')
+            if match:
+                attribute = match.group(1)
+
+    indicators = sorted(indicators)
+    elements = {}
+    for start in range(0, len(indicators), 30):
+        found = api.get('programIndicators', params={
+            'filter': 'id:in:[' + ','.join(indicators[start:start + 30]) + ']',
+            'fields': 'id,name,attributeValues[value,attribute[id]]',
+            'paging': 'false'}).json()['programIndicators']
+        for indicator in found:
+            for value in indicator.get('attributeValues', []):
+                if value['attribute']['id'] == attribute:
+                    elements[value['value']] = indicator['name']
+
+    if not elements:
+        logger.error("  no indicator names its aggregate data element in "
+                     f"attribute {attribute}; cannot verify")
+        return False
+
+    root = api.get('organisationUnits', params={
+        'filter': 'level:eq:1', 'fields': 'id', 'paging': 'false'}
+    ).json()['organisationUnits'][0]['id']
+
+    rows = api.get('analytics', params={
+        'dimension': [f"dx:{';'.join(elements)}",
+                      'pe:LAST_12_MONTHS;THIS_MONTH;LAST_4_QUARTERS;THIS_QUARTER'],
+        'filter': f'ou:{root}', 'skipMeta': 'true'}).json().get('rows', [])
+
+    written = {row[0] for row in rows}
+    missing = sorted(name for uid, name in elements.items() if uid not in written)
+
+    logger.info(f"  aggregate values visible: {len(rows)} cells across "
+                f"{len(written)}/{len(elements)} data elements")
+    for name in missing:
+        logger.warning(f"    no value anywhere: {name}")
+
+    if not written:
+        logger.error("  the exchanges wrote nothing the dashboard can read.")
+        return False
+    return True
 
 
 def main():
@@ -175,9 +249,18 @@ def main():
 
     run_analytics(api, 'so the dashboard sees the new aggregate values')
 
+    step("verify the aggregate values landed")
+    complete = verify_aggregates(api)
+
     step("done")
-    logger.warning("Rebuild complete. Verify with the aggregate readback.")
+    if complete:
+        logger.warning("Rebuild complete.")
+    else:
+        logger.error("Rebuild finished with aggregate values missing; "
+                     "rerun the exchanges before trusting a dashboard.")
+        return 1
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
