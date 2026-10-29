@@ -158,7 +158,8 @@ def main():
         run(['purge_aggregate_values.py', '--target', args.target, '--confirm', 'DELETE'])
 
     step(f"generate {args.patients} patients")
-    run(['move_patients_egypt.py', '--target', args.target, '--after', args.after,
+    run(['htn_engine.py', '--instance', 'egypt', '--target', args.target,
+         '--after', args.after,
          '--patients', str(args.patients), '--seed', str(args.seed),
          '--chunk-size', str(args.chunk_size)])
 

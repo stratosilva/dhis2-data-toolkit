@@ -21,7 +21,12 @@ import sys
 from dhis2 import RequestException as DHIS2RequestException
 from logzero import logger
 
-import move_patients_egypt as gen
+import htn_engine as gen
+import htn_instances
+
+# The generator is instance-agnostic now, so it has to be told which one it is
+# checking before its field maps mean anything.
+gen.configure(htn_instances.EGYPT)
 import purge_aggregate_values as agg
 from diff_metadata import looks_disabled
 from tracker_common import load_api
@@ -70,7 +75,7 @@ def check_stage_assignments(api):
     """
     problems = 0
     try:
-        stage = api.get(f'programStages/{gen.TARGET_PROGRAM_STAGE}', params={
+        stage = api.get(f'programStages/{gen.VISIT_STAGE}', params={
             'fields': 'name,programStageDataElements[dataElement[id,name]]'}).json()
     except DHIS2RequestException as e:
         logger.error(f"  visit stage lookup failed ({str(e)[:80]})")
@@ -188,12 +193,12 @@ def main():
             'fields': 'id,name,trackedEntityType[id],programStages[id,name]'}).json()
         stages = {s['id'] for s in p.get('programStages', [])}
         logger.info(f"  programme {gen.TARGET_PROGRAM}         '{p.get('name')}'")
-        if gen.TARGET_PROGRAM_STAGE not in stages:
-            logger.error(f"  visit stage {gen.TARGET_PROGRAM_STAGE} NOT on this "
+        if gen.VISIT_STAGE not in stages:
+            logger.error(f"  visit stage {gen.VISIT_STAGE} NOT on this "
                          f"programme (has {sorted(stages)})")
             problems += 1
         else:
-            logger.info(f"  visit stage {gen.TARGET_PROGRAM_STAGE}       present")
+            logger.info(f"  visit stage {gen.VISIT_STAGE}       present")
         tet = (p.get('trackedEntityType') or {}).get('id')
         if tet != gen.TARGET_TRACKED_ENTITY_TYPE:
             logger.error(f"  tracked entity type is {tet}, scripts assume "
@@ -209,7 +214,7 @@ def main():
     for endpoint, uids, label in (
             ('trackedEntityAttributes', gen.TEA.values(), 'tracked entity attributes'),
             ('dataElements', gen.DE.values(), 'visit data elements'),
-            ('optionSets', [gen.DISTRICT_OPTION_SET, gen.GOVERNORATE_OPTION_SET],
+            ('optionSets', [htn_instances.EGYPT.district_option_set, htn_instances.EGYPT.governorate_option_set],
              'geography option sets'),
     ):
         _, missing = exists(api, endpoint, list(uids), label)

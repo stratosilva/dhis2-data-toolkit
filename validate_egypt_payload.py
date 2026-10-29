@@ -1,8 +1,8 @@
 """
 Check a generated Egypt payload against the clinical and metadata rules the
-programme expects. Run after move_patients_egypt.py --dry-run.
+programme expects. Run after htn_engine.py --instance egypt --dry-run.
 
-    python move_patients_egypt.py --after 2025-01-01 --dry-run --limit 400
+    python htn_engine.py --instance egypt --dry-run --limit 400
     python validate_egypt_payload.py egypt_payload_preview.json
 """
 
@@ -11,7 +11,10 @@ import sys
 from collections import Counter
 from datetime import date, datetime
 
-import move_patients_egypt as mp
+import htn_engine as mp
+import htn_instances
+
+mp.configure(htn_instances.EGYPT)
 
 TEA, DE = mp.TEA, mp.DE
 
