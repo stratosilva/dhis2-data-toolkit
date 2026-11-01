@@ -102,21 +102,82 @@ def run_one(api, uid, name):
     return ok, elapsed, verdict
 
 
-def _facilities(api, ou_terms, wanted=5):
-    """A few org units at the level a request writes into."""
-    levels = [term.split('-', 1)[1] for term in ou_terms
-              if str(term).upper().startswith('LEVEL-')]
-    if not levels:
+def _program(api, indicators):
+    """The program the exchange's indicators belong to."""
+    for batch in adex_config._in_batches(sorted(indicators)):
+        found = api.get('programIndicators', params={
+            'filter': 'id:in:[' + ','.join(batch) + ']',
+            'fields': 'program[id]', 'paging': 'false'}).json()['programIndicators']
+        for indicator in found:
+            program = (indicator.get('program') or {}).get('id')
+            if program:
+                return program
+    return None
+
+
+# Pages of patients come back clustered by facility, so a single page sees
+# only a handful. Spreading the sample over pages far apart is what makes it
+# cover the programme rather than its first facility.
+SAMPLE_PAGES = (1, 5, 9, 13)
+SAMPLE_PAGE_SIZE = 1000
+
+
+def _facilities(api, program, wanted=6):
+    """
+    Facilities that actually hold patients, taken from the programme itself.
+
+    Asking the hierarchy for org units at the request's level instead picks
+    whatever sorts first, and on sandbox 1 that is 5 of 50,801 facilities when
+    the cohort occupies about 40 - so every request read back empty and the
+    fallback ran on a run that had worked. Facilities carrying patients are
+    the only ones a request has any reason to write into.
+    """
+    if not program:
         return []
-    described = api.get('organisationUnitLevels', params={
-        'filter': f'id:eq:{levels[0]}', 'fields': 'level', 'paging': 'false'}
-    ).json()['organisationUnitLevels']
-    if not described:
+    root = api.get('organisationUnits', params={
+        'filter': 'level:eq:1', 'fields': 'id', 'paging': 'false'}
+    ).json()['organisationUnits']
+    if not root:
         return []
-    found = api.get('organisationUnits', params={
-        'filter': f"level:eq:{described[0]['level']}", 'fields': 'id,name',
-        'paging': 'false'}).json()['organisationUnits']
-    return found[:wanted]
+
+    sites = {}
+    for page in SAMPLE_PAGES:
+        if len(sites) >= wanted:
+            break
+        try:
+            found = api.get('tracker/trackedEntities', params={
+                'orgUnit': root[0]['id'], 'ouMode': 'DESCENDANTS',
+                'program': program, 'fields': 'orgUnit',
+                'pageSize': str(SAMPLE_PAGE_SIZE), 'page': str(page)}).json()
+        except DHIS2RequestException:
+            break
+        for entity in found.get('trackedEntities') or found.get('instances') or []:
+            sites.setdefault(entity['orgUnit'], {'id': entity['orgUnit']})
+    return list(sites.values())[:wanted]
+
+
+def _latest_elapsed(periods, today):
+    """
+    The most recent period in the list that has finished.
+
+    A period still running has no complete figure to check: on the 1st of the
+    month, which is when cron fires, THIS_MONTH holds nothing because nothing
+    has happened in it yet, and reading that as a failed exchange would run
+    the fallback every month on every instance. Returns None when the request
+    covers nothing that has finished, and the caller then says so rather than
+    calling the request empty.
+    """
+    in_progress = {
+        replace_adex.month_id(date(today.year, today.month, 1)),
+        replace_adex.shift_quarter(today, 0),
+        replace_adex.iso_week_id(today),
+        f'{today.year:04d}',
+        today.isoformat(),
+    }
+    for period in reversed(periods):
+        if period.output not in in_progress:
+            return period
+    return None
 
 
 def verify(api, today):
@@ -132,8 +193,20 @@ def verify(api, today):
 
     A request is only called empty when every sampled data element is empty at
     every sampled facility, so one quiet facility cannot raise a false alarm.
-    These data elements belong to no data set, which is why each value is read
-    singly through /api/dataValues rather than exported.
+
+    What this cannot see: a request is checked against the most recent period
+    it covers that has finished, so the current-period requests are not
+    checked at all on the day cron runs, and the backfill requests are checked
+    against last month, which earlier runs have already filled. An exchange
+    that answered 200 and then quietly skipped a backfill request would find
+    those leftovers and pass. Checking lastUpdated instead would close that,
+    and it is available - exporting dataValueSets with de, pe and ou all
+    pinned returns it - but it trades a rare miss for a monthly false alarm:
+    an unchanged value re-posted by the same writer is ignored and its
+    lastUpdated does not move, and a backfill period's numbers stop changing
+    once its month is over. The failure that
+    actually happens here is the proxy timing out, which run_one catches
+    before this runs.
     """
     config, _dropped = adex_config.build(api)
     requests = config['source']['requests']
@@ -141,18 +214,27 @@ def verify(api, today):
     mapping = adex_config._target_elements(
         api, {uid for r in requests for uid in r['dx']}, attribute)
 
+    sites = _facilities(api, _program(api, {uid for r in requests for uid in r['dx']}))
+    if not sites:
+        logger.warning("    no facility holding patients was found; the readback "
+                       "cannot say anything about this run")
+        return []
+    logger.info(f"    sampling {len(sites)} facility(ies) that hold patients")
+
     empty_requests = []
     for request in requests:
         periods = replace_adex.resolve_period(request['pe'][0], today)
         if not periods:
             continue
-        # The most recent period the request covers, which is the one a run
-        # that has just finished must have written.
-        period = periods[-1].output
+        elapsed = _latest_elapsed(periods, today)
+        if elapsed is None:
+            logger.info(f"    {request['name']}: covers only a period still in "
+                        f"progress, nothing to check yet")
+            continue
+        period = elapsed.output
         elements = [mapping[uid][1] for uid in request['dx']
                     if uid in mapping and mapping[uid][1]][:6]
-        sites = _facilities(api, request.get('ou') or [])
-        if not elements or not sites:
+        if not elements:
             continue
 
         found = 0

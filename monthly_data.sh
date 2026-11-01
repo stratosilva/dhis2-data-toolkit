@@ -35,7 +35,15 @@ set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PYTHON="${PYTHON:-$REPO/.venv/bin/python}"
-[ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
+[ -x "$PYTHON" ] || PYTHON="$(command -v python3 || true)"
+if [ -z "$PYTHON" ]; then
+    # Say so, loudly. Without the "|| true" above, set -e killed the script
+    # here with status 1 and not a word of output - from cron that is a month
+    # silently skipped, which is the one failure this run is meant to catch.
+    echo "monthly_data.sh: no interpreter found. Create $REPO/.venv, or set" >&2
+    echo "PYTHON to one. Looked for $REPO/.venv/bin/python and python3." >&2
+    exit 2
+fi
 
 LOG_DIR="${LOG_DIR:-$REPO/logs}"
 LOCK_FILE="${LOCK_FILE:-/tmp/htn-monthly-data.lock}"
