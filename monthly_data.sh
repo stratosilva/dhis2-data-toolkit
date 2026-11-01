@@ -69,12 +69,17 @@ FACILITIES_PER_STATE_nigeria="${FACILITIES_PER_STATE_nigeria:-20}"
 INSTANCES="nigeria demo egypt"
 DRY_RUN=""
 MONTH=""
+# Skip generating and topping up and run only analytics, the exchange
+# and analytics again. For re-running the aggregate half after it
+# failed, without adding a second month of patients.
+AGGREGATE_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --instances) INSTANCES="$2"; shift 2 ;;
         --month)     MONTH="$2"; shift 2 ;;
         --dry-run)   DRY_RUN="--dry-run"; shift ;;
+        --aggregate-only) AGGREGATE_ONLY=1; shift ;;
         --help|-h)   sed -n '2,40p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -169,17 +174,21 @@ for instance in $INSTANCES; do
 
     ok=1
 
+    if [ "$AGGREGATE_ONLY" -eq 1 ]; then
+        say "  aggregate-only: skipping new patients and the top-up"
+    fi
+
     # This month's arrivals. The enrolment window is this month only, so each
     # run adds new patients rather than backfilling history again.
-    run_step "$PYTHON" htn_engine.py --instance "$instance" \
+    [ "$AGGREGATE_ONLY" -eq 0 ] && { run_step "$PYTHON" htn_engine.py --instance "$instance" \
         --patients "$new_patients" \
         --enrol-from "$PERIOD_START" --enrol-to "$PERIOD_END" \
-        --seed "$MONTH_SEED" $facility_args $DRY_RUN || ok=0
+        --seed "$MONTH_SEED" $facility_args $DRY_RUN || ok=0; }
 
     # Existing patients: the open appointment becomes a completed visit and a
     # fresh one is booked. Only patients with no visit in the period qualify,
     # so this cannot give anyone two visits in one month.
-    [ $ok -eq 1 ] && { run_step "$PYTHON" htn_engine.py --instance "$instance" \
+    [ $ok -eq 1 ] && [ "$AGGREGATE_ONLY" -eq 0 ] && { run_step "$PYTHON" htn_engine.py --instance "$instance" \
         --visits-only "$topup_visits" \
         --period-from "$PERIOD_START" --period-to "$PERIOD_END" \
         --seed "$MONTH_SEED" $DRY_RUN || ok=0; }
@@ -191,7 +200,28 @@ for instance in $INSTANCES; do
     fi
 
     [ $ok -eq 1 ] && { run_step "$PYTHON" run_analytics.py --target "$target" || ok=0; }
-    [ $ok -eq 1 ] && { run_step "$PYTHON" run_adex_staging.py --target "$target" || ok=0; }
+
+    # The instance's own exchange job first, so that the month this stops
+    # working is recorded. It is a single long request, and the proxy closes
+    # the connection at about 60 seconds; as the cohorts grow, that is the
+    # limit they will hit.
+    #
+    # run_exchange.py does not trust the response. A 504 cannot tell a
+    # finished job from a dead one, and import counts cannot either: a
+    # re-post by a different writer touches storedBy, so DHIS2 calls it
+    # "updated" even when the number is unchanged. It reads the data back
+    # instead and asks whether each request wrote anything at all, which is
+    # the shape the sandbox 1 failure took - the DM requests had written
+    # nothing, for any period or facility.
+    if [ $ok -eq 1 ]; then
+        if run_step "$PYTHON" run_exchange.py --target "$target"; then
+            say "  exchange job: OK, and the readback found values for every request"
+        else
+            say "  !! exchange job failed or left requests empty; running the script"
+            run_step "$PYTHON" run_adex_staging.py --target "$target" || ok=0
+        fi
+    fi
+
     [ $ok -eq 1 ] && { run_step "$PYTHON" run_analytics.py --target "$target" || ok=0; }
 
     if [ $ok -eq 1 ]; then

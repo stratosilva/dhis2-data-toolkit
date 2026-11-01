@@ -39,6 +39,54 @@ import adex_config  # noqa: E402
 from tracker_common import load_api  # noqa: E402
 
 
+class Tally:
+    """Running totals of what the data value posts did."""
+
+    def __init__(self):
+        self.posts = self.imported = self.updated = self.ignored = 0
+        self.conflicts = 0
+
+    @property
+    def changed(self):
+        return self.imported + self.updated
+
+    def add(self, response):
+        self.posts += 1
+        try:
+            body = response.json()
+        except (ValueError, AttributeError):
+            return
+        body = body.get('response', body)
+        counts = body.get('importCount') or body
+        self.imported += counts.get('imported') or 0
+        self.updated += counts.get('updated') or 0
+        self.ignored += counts.get('ignored') or 0
+        self.conflicts += len(body.get('conflicts') or [])
+
+
+class Counted:
+    """
+    The Api, with dataValueSets posts counted on the way through.
+
+    replace_adex.py reports each post to its own log and returns nothing, so
+    the totals are taken here rather than by reading that log back. Everything
+    other than the counting is the real Api's.
+    """
+
+    def __init__(self, api, tally):
+        self._api = api
+        self._tally = tally
+
+    def post(self, endpoint, *args, **kwargs):
+        response = self._api.post(endpoint, *args, **kwargs)
+        if str(endpoint).strip('/') == 'dataValueSets':
+            self._tally.add(response)
+        return response
+
+    def __getattr__(self, name):
+        return getattr(self._api, name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -91,13 +139,26 @@ def main():
                                         encoding='utf-8')
             logger.info(f"  config written to {args.save_config}")
 
+    # How much this run wrote, counted off the posts as they go because
+    # replace_adex does not return it. Read "imported" and leave "updated"
+    # alone: a value re-posted by a different writer counts as updated even
+    # when the number is unchanged, because storedBy moves, so the figure says
+    # nothing about whether the instance's own exchange job had done its work.
+    # run_exchange.py settles that by reading the data back.
+    tally = Tally()
     try:
-        replace_adex.process(config_path, api, date.today(), args.org_unit_level)
+        replace_adex.process(config_path, Counted(api, tally), date.today(),
+                             args.org_unit_level)
     finally:
         if temporary is not None:
             Path(temporary.name).unlink(missing_ok=True)
 
-    logger.info("ADEx run complete.")
+    logger.info(f"ADEx run complete: {tally.posts} post(s), "
+                f"imported {tally.imported}, updated {tally.updated}, "
+                f"ignored {tally.ignored}, conflicts {tally.conflicts}")
+    if tally.imported:
+        logger.warning(f"  {tally.imported} value(s) did not exist before this "
+                       f"run and have now been created")
 
 
 if __name__ == '__main__':
