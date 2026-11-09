@@ -29,10 +29,42 @@ from dhis2_env import api_from_env
 # Credentials
 # ---------------------------------------------------------------------------
 
+# No request may hang longer than this. Long enough for the slowest call the
+# toolkit makes - the aggregate exchange, which the proxy cuts off at 60
+# seconds - and short enough that a dead network costs minutes, not a night.
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 300
+
+
+def _apply_default_timeout(api, seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS):
+    """
+    Give every request a deadline.
+
+    requests waits forever on a socket nothing answers, so a laptop that drops
+    its network mid-run leaves a call hanging instead of failing. An analytics
+    poll hung for ten hours against its own 90 minute budget that way: the
+    budget guards the polling loop, and the loop cannot come round while one
+    call inside it is stuck. The dhis2 client passes timeout=None explicitly,
+    so this fills in a value rather than relying on a default.
+    """
+    session = getattr(api, 'session', None)
+    if session is None or getattr(session, '_toolkit_timeout', False):
+        return api
+    original = session.request
+
+    def with_timeout(method, url, **kwargs):
+        if kwargs.get('timeout') is None:
+            kwargs['timeout'] = seconds
+        return original(method, url, **kwargs)
+
+    session.request = with_timeout
+    session._toolkit_timeout = True
+    return api
+
+
 def load_api(prefix, label):
     """Build an Api from the .env credentials for a server prefix."""
     try:
-        return api_from_env(prefix)
+        return _apply_default_timeout(api_from_env(prefix))
     except (FileNotFoundError, KeyError) as e:
         logger.error(f"ERROR: cannot load {label} credentials: {e}")
         sys.exit(2)
@@ -198,6 +230,31 @@ def _created_tei_uids(result):
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+def import_error_uids(exception):
+    """
+    The uids the server actually objected to in a failed /api/tracker call.
+
+    A 409 fails the whole payload, not just the offending records, so a caller
+    that sends records in chunks loses the innocent ones alongside the guilty.
+    Knowing which uids were named lets it send the rest again. Returns None
+    when the failure was not a validation report at all - a dropped connection
+    names nothing, and retrying the remainder would only fail the same way.
+    """
+    body = getattr(exception, 'description', None)
+    if not body:
+        return None
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return None
+
+    validation = parsed.get('validationReport') or {}
+    reports = validation.get('errorReports')
+    if not reports:
+        return None
+    return {r.get('uid') for r in reports if r.get('uid')}
+
 
 def import_error_reports(exception):
     """

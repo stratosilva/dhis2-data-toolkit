@@ -30,7 +30,7 @@ from dhis2 import RequestException as DHIS2RequestException
 from logzero import logger
 from requests.exceptions import RequestException as RequestsRequestException
 
-from tracker_common import import_error_reports
+from tracker_common import import_error_reports, import_error_uids
 
 DEFAULT_NEXT_INTERVAL_DAYS = 28
 
@@ -309,13 +309,25 @@ def build_topup_payload(candidates, previous, build_values, period_start,
     return events, built
 
 
+class TopupFailed(RuntimeError):
+    """Raised when a real top-up run wrote nothing at all."""
+
+
 def post_events(api, events, chunk_size=50, run_rules=True):
-    """Send the recycled visits and their new appointments."""
+    """
+    Send the recycled visits and their new appointments.
+
+    Returns the import counts and the patients whose events actually landed.
+    A rejected chunk takes every event in it down, including the ones the
+    server had no complaint about, so "which patients were written" cannot be
+    inferred from the totals - it has to be collected as the chunks go.
+    """
     params = {'async': 'false', 'importStrategy': 'CREATE_AND_UPDATE'}
     if not run_rules:
         params['skipRuleEngine'] = 'true'
 
     created = updated = ignored = 0
+    written = set()
 
     for start in range(0, len(events), chunk_size):
         chunk = events[start:start + chunk_size]
@@ -326,8 +338,14 @@ def post_events(api, events, chunk_size=50, run_rules=True):
             created += stats.get('created', 0)
             updated += stats.get('updated', 0)
             ignored += stats.get('ignored', 0)
-            for report in (result.get('validationReport', {})
-                           .get('errorReports', []) or [])[:3]:
+
+            reports = result.get('validationReport', {}).get('errorReports', []) or []
+            refused = {r.get('uid') for r in reports if r.get('uid')}
+            written.update(e['trackedEntity'] for e in chunk
+                           if e.get('trackedEntity')
+                           and e.get('event') not in refused)
+
+            for report in reports[:3]:
                 logger.error(f"  chunk {chunk_no} {report.get('errorCode')}: "
                              f"{report.get('message')}")
         except (DHIS2RequestException, RequestsRequestException) as e:
@@ -335,8 +353,58 @@ def post_events(api, events, chunk_size=50, run_rules=True):
             for line in sorted(set(import_error_reports(e)))[:5]:
                 logger.error(f"    {line}")
 
+            salvaged = _retry_without_refused(api, chunk, e, params, chunk_no)
+            if salvaged:
+                stats, keep = salvaged
+                created += stats.get('created', 0)
+                updated += stats.get('updated', 0)
+                ignored += stats.get('ignored', 0)
+                written.update(keep)
+
     logger.info(f"  events: created {created}, updated {updated}, ignored {ignored}")
-    return created, updated, ignored
+    return created, updated, ignored, written
+
+
+def _retry_without_refused(api, chunk, exception, params, chunk_no):
+    """
+    Send a rejected chunk again with the refused records left out.
+
+    A 409 fails the whole payload, so one event the server dislikes costs
+    every patient it was batched with. On sandbox 1 that turned a handful of
+    genuinely bad events into hundreds of lost visits. A patient's visit and
+    their next appointment go together or not at all: writing the appointment
+    while the visit is refused would leave them holding two open ones, which
+    is the one state find_candidates cannot untangle.
+    """
+    refused = import_error_uids(exception)
+    if not refused:
+        return None
+
+    keep_tes = {e['trackedEntity'] for e in chunk
+                if e.get('trackedEntity')
+                and not any(other.get('event') in refused
+                            for other in chunk
+                            if other.get('trackedEntity') == e['trackedEntity'])}
+    remainder = [e for e in chunk if e.get('trackedEntity') in keep_tes]
+    if not remainder or len(remainder) == len(chunk):
+        return None
+
+    try:
+        result = api.post('tracker', params=params,
+                          json={'events': remainder}).json()
+    except (DHIS2RequestException, RequestsRequestException):
+        logger.error(f"  chunk {chunk_no}: the remainder was refused too")
+        return None
+
+    reports = result.get('validationReport', {}).get('errorReports', []) or []
+    still_refused = {r.get('uid') for r in reports if r.get('uid')}
+    kept = {e['trackedEntity'] for e in remainder
+            if not any(other.get('event') in still_refused
+                       for other in remainder
+                       if other.get('trackedEntity') == e['trackedEntity'])}
+    logger.info(f"  chunk {chunk_no}: {len(kept)} patient(s) recovered from the "
+                f"rejected batch")
+    return result.get('stats', {}), kept
 
 
 def run_topup(api, *, program, stage, org_units, limit, build_values,
@@ -390,7 +458,23 @@ def run_topup(api, *, program, stage, org_units, limit, build_values,
                     f"not posted")
         return built
 
-    post_events(api, events, chunk_size=chunk_size, run_rules=run_rules)
+    _created, _updated, _ignored, seen = post_events(
+        api, events, chunk_size=chunk_size, run_rules=run_rules)
+    # Patients, not events: each one is a visit plus the appointment that
+    # follows it, so the import counts are double what was asked for and
+    # comparing them against `built` understates the damage by half.
+    written = len(seen)
+    if not written:
+        # post_events logs each rejection and carries on, which is right for
+        # one bad record and wrong for a whole run. When the laptop's network
+        # went down mid-run, 562 chunks were refused, nothing was written, and
+        # this still returned the number it had BUILT - so the step exited 0
+        # and cron would have recorded the month as done.
+        raise TopupFailed(f"{built} visit(s) were built and every one was "
+                          f"rejected; nothing was written")
+    if written < built:
+        logger.warning(f"  only {written} of {built} built visit(s) were "
+                       f"written; the rest were rejected")
 
     if follow_up:
         attribute, value = follow_up
@@ -398,10 +482,15 @@ def run_topup(api, *, program, stage, org_units, limit, build_values,
             logger.error("  follow-up status not updated: run_topup needs "
                          "tracked_entity_type alongside follow_up")
         else:
-            _set_follow_up(api, candidates, attribute, value,
-                           tracked_entity_type, chunk_size)
+            # Only the patients whose visit actually landed. Moving the status
+            # off "overdue" for a patient whose visit was refused would say
+            # they had been seen when they had not, and the appointment they
+            # are still waiting on is the overdue one.
+            _set_follow_up(api, [c for c in candidates
+                                 if c['trackedEntity'] in seen],
+                           attribute, value, tracked_entity_type, chunk_size)
 
-    return built
+    return written
 
 
 def _set_follow_up(api, candidates, attribute, value, tracked_entity_type,

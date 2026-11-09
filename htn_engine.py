@@ -52,6 +52,7 @@ import random
 import re
 import string
 import sys
+import time
 import uuid
 from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
@@ -63,7 +64,7 @@ from logzero import logfile, logger
 from requests.exceptions import RequestException as RequestsRequestException
 
 import htn_instances
-from topup_visits import run_topup
+from topup_visits import TopupFailed, run_topup
 from tracker_common import (
     age_from_dob,
     guard_destructive,
@@ -4189,6 +4190,17 @@ def profile_from_existing(attributes, previous_values):
     return profile, previous_regimen
 
 
+class AttributeLookupFailed(RuntimeError):
+    """Raised when a patient's attributes cannot be read, so no visit is built."""
+
+
+# A patient's attributes are read one at a time, so a blip costs one retry
+# rather than the run. Three attempts over a few seconds rides out a brief
+# wobble; a network that is actually gone still fails inside a minute.
+ATTRIBUTE_FETCH_ATTEMPTS = 3
+ATTRIBUTE_FETCH_BACKOFF_SECONDS = 2
+
+
 def nigeria_visit_builder(api, stats):
     """
     A build_values function for topup_visits, closed over the attribute lookup
@@ -4199,16 +4211,45 @@ def nigeria_visit_builder(api, stats):
     cache = {}
 
     def attributes_for(tracked_entity):
-        if tracked_entity not in cache:
+        """
+        One patient's attributes, or a hard stop.
+
+        What this must never do is hand back an empty dict when the lookup
+        failed. profile_from_existing reads a patient's sex, age and height
+        from here and invents them when they are missing, which is right for a
+        patient who genuinely has none and catastrophic for one whose lookup
+        merely errored: the visit is then built for an invented body. That is
+        what happened on the night sandbox 1's network died mid-run - 2,267
+        visits were built with a resampled height, and every one was refused
+        by the rule that copies height from the attribute. The rule caught it
+        only because height happens to be rule-owned; sex and age would have
+        been written without a murmur.
+        """
+        if tracked_entity in cache:
+            return cache[tracked_entity]
+
+        last = None
+        for attempt in range(ATTRIBUTE_FETCH_ATTEMPTS):
             try:
                 te = api.get(f'tracker/trackedEntities/{tracked_entity}', params={
                     'program': TARGET_PROGRAM,
                     'fields': 'attributes[attribute,value]'}).json()
                 cache[tracked_entity] = {a['attribute']: a.get('value')
                                          for a in te.get('attributes', [])}
-            except (DHIS2RequestException, RequestsRequestException):
-                cache[tracked_entity] = {}
-        return cache[tracked_entity]
+                return cache[tracked_entity]
+            except (DHIS2RequestException, RequestsRequestException) as e:
+                # A patient who is not there is an answer, not a failure: they
+                # have no attributes, and the visit builder can say so.
+                if getattr(e, 'code', None) == 404:
+                    cache[tracked_entity] = {}
+                    return cache[tracked_entity]
+                last = e
+                if attempt + 1 < ATTRIBUTE_FETCH_ATTEMPTS:
+                    time.sleep(ATTRIBUTE_FETCH_BACKOFF_SECONDS * (attempt + 1))
+
+        raise AttributeLookupFailed(
+            f"could not read patient {tracked_entity}'s attributes after "
+            f"{ATTRIBUTE_FETCH_ATTEMPTS} attempts: {last}")
 
     def build(tracked_entity, previous_event, visit_date):
         previous_values = {dv['dataElement']: dv.get('value')
@@ -4298,7 +4339,7 @@ def topup_org_units(api, args):
 
 def run_visits_only(args, api, target_ous, stats):
     """Give existing patients their visit for the period."""
-    built = run_topup(
+    written = run_topup(
         api,
         program=TARGET_PROGRAM,
         stage=VISIT_STAGE,
@@ -4316,7 +4357,8 @@ def run_visits_only(args, api, target_ous, stats):
         follow_up=(TEA['follow_up_status'], FOLLOW_UP_UPCOMING),
         tracked_entity_type=TARGET_TRACKED_ENTITY_TYPE,
     )
-    stats['migrated'] = built
+    stats['migrated'] = written
+    stats['written'] = written
 
 
 def parse_args():
@@ -4552,7 +4594,16 @@ def report_topup(stats):
     """A top-up writes visits, not patients, so the population mix does not
     apply; what matters is how those visits classified."""
     logger.info("=" * 62)
-    logger.info(f"Visits added                   {stats['visits']}")
+    # What landed, not what was built. The two differ when the server refuses
+    # events, and a run that reported the number it had built once let a month
+    # in which nothing at all was written pass for a finished one.
+    built = stats['visits']
+    written = stats.get('written', built)
+    if written == built:
+        logger.info(f"Visits added                   {written}")
+    else:
+        logger.info(f"Visits added                   {written}  "
+                    f"({built} built, {built - written} refused)")
     total = sum(stats[f'cat::{c}'] for c in TRANSITION_CATEGORIES) or 1
     for category in TRANSITION_CATEGORIES:
         count = stats[f'cat::{category}']
@@ -4692,3 +4743,14 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.error("Interrupted by user.")
         sys.exit(130)
+    except AttributeLookupFailed as failure:
+        # The server stopped answering mid-build. Stopping here is the whole
+        # point: carrying on would write visits for patients whose records
+        # were never read.
+        logger.error(f"Top-up stopped: {failure}")
+        sys.exit(1)
+    except TopupFailed as failure:
+        # A clean exit rather than a traceback: this one is routine enough
+        # that the monthly log should read as a report, not a crash.
+        logger.error(f"Top-up wrote nothing: {failure}")
+        sys.exit(1)
